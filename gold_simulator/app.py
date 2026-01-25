@@ -100,7 +100,7 @@ COHORT_DEFAULTS = {
         "free_5_energy": True,
         "buy_10_energy": 0,
         "buy_20_energy": 0,
-        "main_play": 10,
+        "main_play": 20,
 
         "sweep_card_on": False,
         "sweep_multiplier": 1.30,
@@ -117,14 +117,14 @@ COHORT_DEFAULTS = {
 
         "minutes_per_energy": 12,
         "free_5_energy": True,
-        "buy_10_energy": 0,
-        "buy_20_energy": 0,
-        "main_play": 10,
+        "buy_10_energy": 1,
+        "buy_20_energy": 1,
+        "main_play": 5,
 
         "sweep_card_on": True,
         "sweep_multiplier": 1.30,
 
-        "epic_card_on": False,
+        "epic_card_on": True,
         "gold_slot_monthly_on": False,
         "bet_choice": "월간 미구매(고정)",
         "chips_used": 0,
@@ -138,7 +138,7 @@ COHORT_DEFAULTS = {
         "free_5_energy": True,
         "buy_10_energy": 1,
         "buy_20_energy": 5,
-        "main_play": 10,
+        "main_play": 5,
 
         "sweep_card_on": True,
         "sweep_multiplier": 1.30,
@@ -157,7 +157,7 @@ COHORT_DEFAULTS = {
         "free_5_energy": True,
         "buy_10_energy": 1,
         "buy_20_energy": 20,
-        "main_play": 10,
+        "main_play": 5,
 
         "sweep_card_on": True,
         "sweep_multiplier": 1.30,
@@ -422,11 +422,9 @@ def scenario_B_new(final_level: int) -> Dict[str, Any]:
 # Sidebar UI
 # =========================================================
 st.sidebar.header("설정")
-c1, _ = st.sidebar.columns(2)
-with c1:
-    if st.button("전체 기본값 리셋"):
-        reset_all()
-        st.rerun()
+if st.sidebar.button("전체 기본값 리셋", use_container_width=True):
+    reset_all()
+    st.rerun()
 
 st.sidebar.divider()
 
