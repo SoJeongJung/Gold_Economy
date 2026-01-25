@@ -451,7 +451,7 @@ gear_factor = st.sidebar.slider("장비레벨 = 계정레벨 × 계수", 0.5, 2.
 gear_offset = st.sidebar.number_input("장비레벨 오프셋(+)", min_value=-50, max_value=200, step=1, key="gear_offset")
 
 st.sidebar.divider()
-st.sidebar.subheader("추가 XP 지급(수동) — 결과(1)에서 사용")
+st.sidebar.subheader("추가 XP 지급(수동값 적용)")
 manual_sweep_only_on = st.sidebar.checkbox("소탕 카드 구매 유저만 N배 적용", key="manual_sweep_only_on")
 xp_boost_N = st.sidebar.slider("N배", 1.0, 20.0, step=0.01, key="xp_boost_N")
 
@@ -875,7 +875,7 @@ for cohort in COHORTS:
         if st.button(f"{cohort} 추천 배율을 적용값으로", key=k(cohort, "btn_apply_reco")):
             st.session_state[k(cohort, "auto_xp_mult_apply")] = reco_val
             st.rerun()
-        st.slider("자동 보정 XP 배율(적용값)", 0.10, 20.0, step=0.01, key=k(cohort, "auto_xp_mult_apply"))
+        st.slider("추천값 보정 XP 배율(적용값)", 0.10, 20.0, step=0.01, key=k(cohort, "auto_xp_mult_apply"))
 
 # =========================================================
 # Render
@@ -910,8 +910,16 @@ def render_result(cohort: str, title: str, sim: Dict[str, Any], auto_mult: float
         f"코호트: {cohort} | 목표 시나리오: {scenario_target} | "
         f"추천 목표 ratio: {TARGET_LOW:.0%}~{TARGET_HIGH:.0%} | "
         f"현재 ratio: {target_ratio:.2%} | "
-        f"자동배율: {auto_mult:.3f}x | 수동: {'ON' if manual_on else 'OFF'}"
     )
+    manual_mult = xp_boost_N if manual_on else 1.0
+    final_xp_mult = auto_mult * manual_mult
+    st.caption(
+        f"XP 배율 구성 | "
+        f"추천값 보정: {auto_mult:.3f}x | "
+        f"추가 XP: {xp_boost_N:.2f}x({'ON' if manual_on else 'OFF'}) | "
+    f"최종 적용: {final_xp_mult:.2f}x"
+    )
+
 
     # 더 알아듣기 쉬운 메시지로 변경(요구사항 반영)
     xp_msg = "정상" if checks["xp_ok"] else "불일치(계산 확인 필요)"
