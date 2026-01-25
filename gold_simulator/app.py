@@ -215,13 +215,32 @@ def passive_gold_rate_from_level(level: int) -> float:
 # =========================================================
 # Load CSV
 # =========================================================
-@st.cache_data
-def load_data():
-    stage_df = pd.read_csv("data/stage_economy.csv")
-    passive_df = pd.read_csv("data/passive_cost.csv")
-    level_df = pd.read_csv("data/account_level.csv")
-    gear_df = pd.read_csv("data/gear_level.csv")
+import io
 
+# =========================================================
+# Upload CSV (NEW)
+# =========================================================
+st.sidebar.header("CSV 업로드")
+st.sidebar.caption("필수 4개 CSV를 업로드하면 시뮬레이션이 실행됩니다.")
+
+up_stage = st.sidebar.file_uploader("stage_economy.csv 업로드", type=["csv"], key="up_stage")
+up_passive = st.sidebar.file_uploader("passive_cost.csv 업로드", type=["csv"], key="up_passive")
+up_level = st.sidebar.file_uploader("account_level.csv 업로드", type=["csv"], key="up_level")
+up_gear = st.sidebar.file_uploader("gear_level.csv 업로드", type=["csv"], key="up_gear")
+
+def _read_uploaded_csv(uploaded_file) -> pd.DataFrame:
+    # Streamlit UploadedFile은 file-like 이지만, cache/재사용 이슈를 피하려고 bytes로 읽어 처리
+    data = uploaded_file.getvalue()
+    return pd.read_csv(io.BytesIO(data))
+
+@st.cache_data
+def load_data_from_uploads(stage_bytes: bytes, passive_bytes: bytes, level_bytes: bytes, gear_bytes: bytes):
+    stage_df = pd.read_csv(io.BytesIO(stage_bytes))
+    passive_df = pd.read_csv(io.BytesIO(passive_bytes))
+    level_df = pd.read_csv(io.BytesIO(level_bytes))
+    gear_df = pd.read_csv(io.BytesIO(gear_bytes))
+
+    # ===== 기존 load_data()의 검증/전처리 로직을 그대로 유지 =====
     required_stage_cols = ["stage", "xp", "gold_stage_play", "gold_shop_free", "gold_dungeon"]
     missing = [c for c in required_stage_cols if c not in stage_df.columns]
     if missing:
@@ -254,15 +273,28 @@ def load_data():
 
     return stage_df, passive_df, level_df, gear_df
 
+# 업로드가 모두 되어야 실행
+if not (up_stage and up_passive and up_level and up_gear):
+    st.warning("왼쪽 사이드바에서 4개 CSV를 모두 업로드해주세요: stage_economy / passive_cost / account_level / gear_level")
+    st.stop()
+
 try:
-    stage_df, passive_df, level_df, gear_df = load_data()
+    stage_df, passive_df, level_df, gear_df = load_data_from_uploads(
+        up_stage.getvalue(),
+        up_passive.getvalue(),
+        up_level.getvalue(),
+        up_gear.getvalue(),
+    )
 except Exception as e:
     st.error(f"데이터 로딩 오류: {e}")
     st.stop()
 
+# 기존 후속 로직은 그대로
 stage_map = stage_df.set_index("stage").to_dict(orient="index")
 MAX_STAGE = int(stage_df["stage"].max())
 MIN_STAGE = int(stage_df["stage"].min())
+
+
 
 # =========================================================
 # Account level calc
