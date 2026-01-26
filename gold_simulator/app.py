@@ -915,6 +915,16 @@ for cohort in COHORTS:
             st.session_state[k(cohort, "auto_xp_mult_apply")] = reco_val
             st.rerun()
         st.slider("추천값 보정 XP 배율(적용값)", 0.10, 20.0, step=0.01, key=k(cohort, "auto_xp_mult_apply"))
+        info = st.session_state.get(k(cohort, "auto_reco_info"))
+        if info:
+            st.markdown("**추천 결과 상세(자동 보정 디버그)**")
+            st.write(f"- 시나리오: {info['scenario']}")
+            st.write(f"- 추천 XP 배율: {info['m']:.4f}x")
+            st.write(f"- ratio(잔액/수급): {info['r']:.2%}")
+            st.write(f"- 잔액(balance): {info['bal']:,}")
+            st.write(f"- 수급 골드(income): {info['income']:,}")
+            st.write(f"- 도달 레벨: Lv.{info['lvl']}")
+
 
 # =========================================================
 # Render
