@@ -10,13 +10,6 @@ st.set_page_config(page_title="경험치·골드 재화 시뮬레이션", layout
 st.title("경험치·골드 재화 시뮬레이션")
 
 # =========================================================
-# 추천/목표 밴드 (요구사항 변경)
-# - "20~25% 사이로 골드가 부족" = 잔액/누적골드 ratio가 -20%~-25% 구간
-# =========================================================
-TARGET_LOW = -0.25
-TARGET_HIGH = -0.20
-
-# =========================================================
 # Utils
 # =========================================================
 def to_int(x):
@@ -38,12 +31,15 @@ def balance_ratio(balance: int, income_gold: int) -> float:
     return balance / income_gold
 
 def target_classify(balance: int, income: int) -> str:
+    low = float(st.session_state["target_low"])
+    high = float(st.session_state["target_high"])
     r = balance_ratio(balance, income)
-    if r < TARGET_LOW:
-        return "과부족"     # 너무 부족
-    if TARGET_LOW <= r <= TARGET_HIGH:
-        return "목표"       # 목표(부족감) 밴드
-    return "여유"           # 덜 부족(또는 넘침)
+    if r < low:
+        return "과부족"
+    if low <= r <= high:
+        return "목표"
+    return "여유"
+
 
 def status_badge(label: str) -> str:
     if label == "과부족":
@@ -67,7 +63,12 @@ DEFAULTS = {
     "period_value": 30,
     "view_day": 30,
 
-    # 골드 슬롯 파라미터(조정 가능)
+    # 자동 보정 목표 밴드(직접 입력)
+    "target_low": -0.25,
+    "target_high": -0.20,
+
+    # 골드 슬롯 파라미터(조정 가능) - 편집 토글
+    "slot_params_edit_on": False,
     "base_slot_multiplier": 1.866,
     "bet_none_multiplier": 2.10,        # 월간 미구매 배팅 1배
     "bet_monthly_multiplier": 1.85,     # 월간 구매 배팅 1배(배팅 없음)
@@ -81,10 +82,11 @@ DEFAULTS = {
     "gear_factor": 1.0,
     "gear_offset": 0,
 
-    # 추가 XP 정책(수동): 소탕 카드 구매 유저만 N배
-    "manual_sweep_only_on": True,
+    # 추가 XP 정책(수동값 적용)
+    # - 소탕 카드 구매 유저에게만 "무조건" 적용 (옵션 제거)
     "xp_boost_N": 2.00,
 }
+
 
 COHORTS = ["무과금", "소과금", "중과금", "핵과금"]
 
@@ -103,7 +105,6 @@ COHORT_DEFAULTS = {
         "main_play": 20,
 
         "sweep_card_on": False,
-        "sweep_multiplier": 1.30,
 
         "epic_card_on": False,
         "gold_slot_monthly_on": False,
@@ -122,7 +123,6 @@ COHORT_DEFAULTS = {
         "main_play": 5,
 
         "sweep_card_on": True,
-        "sweep_multiplier": 1.30,
 
         "epic_card_on": True,
         "gold_slot_monthly_on": False,
@@ -141,7 +141,6 @@ COHORT_DEFAULTS = {
         "main_play": 5,
 
         "sweep_card_on": True,
-        "sweep_multiplier": 1.30,
 
         "epic_card_on": True,
         "gold_slot_monthly_on": True,
@@ -160,7 +159,6 @@ COHORT_DEFAULTS = {
         "main_play": 5,
 
         "sweep_card_on": True,
-        "sweep_multiplier": 1.30,
 
         "epic_card_on": True,
         "gold_slot_monthly_on": True,
@@ -227,11 +225,6 @@ up_stage = st.sidebar.file_uploader("stage_economy.csv 업로드", type=["csv"],
 up_passive = st.sidebar.file_uploader("passive_cost.csv 업로드", type=["csv"], key="up_passive")
 up_level = st.sidebar.file_uploader("account_level.csv 업로드", type=["csv"], key="up_level")
 up_gear = st.sidebar.file_uploader("gear_level.csv 업로드", type=["csv"], key="up_gear")
-
-def _read_uploaded_csv(uploaded_file) -> pd.DataFrame:
-    # Streamlit UploadedFile은 file-like 이지만, cache/재사용 이슈를 피하려고 bytes로 읽어 처리
-    data = uploaded_file.getvalue()
-    return pd.read_csv(io.BytesIO(data))
 
 @st.cache_data
 def load_data_from_uploads(stage_bytes: bytes, passive_bytes: bytes, level_bytes: bytes, gear_bytes: bytes):
@@ -450,20 +443,55 @@ use_gear_table = st.sidebar.checkbox("장비 강화 소비를 gear_level.csv로 
 gear_factor = st.sidebar.slider("장비레벨 = 계정레벨 × 계수", 0.5, 2.0, step=0.05, key="gear_factor")
 gear_offset = st.sidebar.number_input("장비레벨 오프셋(+)", min_value=-50, max_value=200, step=1, key="gear_offset")
 
-st.sidebar.divider()
 st.sidebar.subheader("추가 XP 지급(수동값 적용)")
-manual_sweep_only_on = st.sidebar.checkbox("소탕 카드 구매 유저만 N배 적용", key="manual_sweep_only_on")
-xp_boost_N = st.sidebar.slider("N배", 1.0, 20.0, step=0.01, key="xp_boost_N")
+st.sidebar.caption("수동값 적용 탭에서만 사용. 소탕 카드 구매 유저에게만 적용됩니다(고정 정책).")
+xp_boost_N = st.sidebar.number_input("추가 XP 배율(N배)", min_value=1.0, max_value=20.0, step=0.01, key="xp_boost_N")
+
+
+st.sidebar.subheader("자동 보정 목표 밴드(ratio)")
+st.sidebar.caption("ratio = 잔액 / 누적골드(수급). 예: -0.25 = -25%")
+st.sidebar.number_input("목표 하한(LOW)", min_value=-0.99, max_value=0.0, step=0.01, key="target_low")
+st.sidebar.number_input("목표 상한(HIGH)", min_value=-0.99, max_value=0.0, step=0.01, key="target_high")
+
+# 안전장치: low가 high보다 크면 스왑
+if float(st.session_state["target_low"]) > float(st.session_state["target_high"]):
+    st.session_state["target_low"], st.session_state["target_high"] = st.session_state["target_high"], st.session_state["target_low"]
+
 
 st.sidebar.divider()
 st.sidebar.subheader("골드 슬롯 파라미터(조정 가능)")
-base_slot_multiplier = st.sidebar.number_input("base_slot_multiplier", min_value=0.0, value=float(st.session_state["base_slot_multiplier"]), step=0.01, key="base_slot_multiplier")
-bet_none_multiplier = st.sidebar.number_input("bet_none_multiplier(미구매 1배)", min_value=0.0, value=float(st.session_state["bet_none_multiplier"]), step=0.01, key="bet_none_multiplier")
-bet_monthly_multiplier = st.sidebar.number_input("bet_monthly_multiplier(구매 1배)", min_value=0.0, value=float(st.session_state["bet_monthly_multiplier"]), step=0.01, key="bet_monthly_multiplier")
-bet_2x_multiplier = st.sidebar.number_input("bet_2x_multiplier", min_value=0.0, value=float(st.session_state["bet_2x_multiplier"]), step=0.01, key="bet_2x_multiplier")
-bet_4x_multiplier = st.sidebar.number_input("bet_4x_multiplier", min_value=0.0, value=float(st.session_state["bet_4x_multiplier"]), step=0.01, key="bet_4x_multiplier")
-bet_2x_cost = st.sidebar.number_input("bet_2x_cost(다이아/스핀)", min_value=0, value=int(st.session_state["bet_2x_cost"]), step=1, key="bet_2x_cost")
-bet_4x_cost = st.sidebar.number_input("bet_4x_cost(다이아/스핀)", min_value=0, value=int(st.session_state["bet_4x_cost"]), step=1, key="bet_4x_cost")
+slot_params_edit_on = st.sidebar.checkbox("골드 슬롯 배율/비용 수정하기", key="slot_params_edit_on")
+disabled_slot = not bool(st.session_state["slot_params_edit_on"])
+
+base_slot_multiplier = st.sidebar.number_input(
+    "base_slot_multiplier", min_value=0.0, value=float(st.session_state["base_slot_multiplier"]),
+    step=0.01, key="base_slot_multiplier", disabled=disabled_slot
+)
+bet_none_multiplier = st.sidebar.number_input(
+    "bet_none_multiplier(미구매 1배)", min_value=0.0, value=float(st.session_state["bet_none_multiplier"]),
+    step=0.01, key="bet_none_multiplier", disabled=disabled_slot
+)
+bet_monthly_multiplier = st.sidebar.number_input(
+    "bet_monthly_multiplier(구매 1배)", min_value=0.0, value=float(st.session_state["bet_monthly_multiplier"]),
+    step=0.01, key="bet_monthly_multiplier", disabled=disabled_slot
+)
+bet_2x_multiplier = st.sidebar.number_input(
+    "bet_2x_multiplier", min_value=0.0, value=float(st.session_state["bet_2x_multiplier"]),
+    step=0.01, key="bet_2x_multiplier", disabled=disabled_slot
+)
+bet_4x_multiplier = st.sidebar.number_input(
+    "bet_4x_multiplier", min_value=0.0, value=float(st.session_state["bet_4x_multiplier"]),
+    step=0.01, key="bet_4x_multiplier", disabled=disabled_slot
+)
+bet_2x_cost = st.sidebar.number_input(
+    "bet_2x_cost(다이아/스핀)", min_value=0, value=int(st.session_state["bet_2x_cost"]),
+    step=1, key="bet_2x_cost", disabled=disabled_slot
+)
+bet_4x_cost = st.sidebar.number_input(
+    "bet_4x_cost(다이아/스핀)", min_value=0, value=int(st.session_state["bet_4x_cost"]),
+    step=1, key="bet_4x_cost", disabled=disabled_slot
+)
+
 
 st.sidebar.divider()
 st.sidebar.subheader("코호트별 정책(무/소/중/핵)")
@@ -517,9 +545,8 @@ def stage_at_day_to_max(day_1based: int, start_stage: int, days_to_max_stage: in
     return s
 
 def manual_xp_multiplier(sweep_card_on: bool) -> float:
-    if not manual_sweep_only_on:
-        return 1.0
-    return float(xp_boost_N) if sweep_card_on else 1.0
+    return float(st.session_state["xp_boost_N"]) if sweep_card_on else 1.0
+
 
 # =========================================================
 # Simulation per cohort
@@ -535,7 +562,6 @@ def run_simulation_for_cohort(cohort: str, auto_xp_mult: float, use_manual: bool
     buy_20_energy_ = int(st.session_state[k(cohort, "buy_20_energy")])
 
     sweep_card_on = bool(st.session_state[k(cohort, "sweep_card_on")])
-    sweep_multiplier_ = float(st.session_state[k(cohort, "sweep_multiplier")])
 
     epic_card_on = bool(st.session_state[k(cohort, "epic_card_on")])
     monthly_on = bool(st.session_state[k(cohort, "gold_slot_monthly_on")])
@@ -578,10 +604,18 @@ def run_simulation_for_cohort(cohort: str, auto_xp_mult: float, use_manual: bool
         gold_shop_free = int(econ["gold_shop_free"])
         gold_dungeon = int(econ["gold_dungeon"])
 
+        # [NEW] 소탕 카드 미구매 유저 페널티: 스테이지별 XP/Gold 30% 감소
+        if not sweep_card_on:
+             xp = floor_int(xp * 0.70)
+             gold_stage_play = floor_int(gold_stage_play * 0.70)
+             gold_dungeon = floor_int(gold_dungeon * 0.70)
+
+
         # XP base
         main_xp_base = main_play * xp
-        quick_xp_base = (quick_sweep * xp * sweep_multiplier_) if sweep_card_on else (quick_sweep * xp)
+        quick_xp_base = quick_sweep * xp
         auto_xp_base = AUTO_SWEEP_COUNT * xp * 2
+
 
         m_manual = manual_xp_multiplier(sweep_card_on) if use_manual else 1.0
         xp_mult = float(auto_xp_mult) * m_manual
@@ -598,7 +632,7 @@ def run_simulation_for_cohort(cohort: str, auto_xp_mult: float, use_manual: bool
 
         # GOLD base
         main_gold_base = main_play * gold_stage_play
-        quick_gold_base = (quick_sweep * gold_stage_play * sweep_multiplier_) if sweep_card_on else (quick_sweep * gold_stage_play)
+        quick_gold_base = quick_sweep * gold_stage_play
         auto_gold_base = AUTO_SWEEP_COUNT * gold_stage_play * 2
         shop_gold_base = gold_shop_free
 
@@ -768,6 +802,9 @@ def run_simulation_for_cohort(cohort: str, auto_xp_mult: float, use_manual: bool
 def recommend_auto_multiplier_for_cohort(cohort: str):
     scenario = "A" if cohort == "핵과금" else "B"
 
+    low = float(st.session_state["target_low"])
+    high = float(st.session_state["target_high"])
+
     candidates = []
     for i in range(80):
         t = i / 79
@@ -786,18 +823,19 @@ def recommend_auto_multiplier_for_cohort(cohort: str):
         bal = res[scenario]["balance"]
         r = balance_ratio(bal, income)
 
-        if TARGET_LOW <= r <= TARGET_HIGH:
-            # 밴드 내: 상한(-20%)에 가장 근접(덜 부족한 쪽으로 여유 최소화)
-            score = abs(TARGET_HIGH - r)
+        if low <= r <= high:
+            # 밴드 내: 상한(high)에 가장 근접(덜 부족한 쪽으로 여유 최소화)
+            score = abs(high - r)
             if best_in_band is None or score < best_in_band["score"]:
                 best_in_band = {"m": m, "r": r, "bal": bal, "income": income, "lvl": res["final"]["level"], "score": score}
         else:
-            dist = (TARGET_LOW - r) if (r < TARGET_LOW) else (r - TARGET_HIGH)
+            dist = (low - r) if (r < low) else (r - high)
             if best_near is None or dist < best_near["dist"]:
                 best_near = {"m": m, "r": r, "bal": bal, "income": income, "lvl": res["final"]["level"], "dist": dist}
 
     chosen = best_in_band if best_in_band is not None else best_near
     return scenario, chosen
+
 
 # =========================================================
 # Cohort UI (Expander)
@@ -837,8 +875,7 @@ for cohort in COHORTS:
         st.divider()
         st.markdown("**소탕 카드(코호트별)**")
         st.checkbox("소탕 카드 ON", key=k(cohort, "sweep_card_on"))
-        st.slider("소탕 카드 배율(빠른 소탕만)", 1.0, 2.0, step=0.05, key=k(cohort, "sweep_multiplier"))
-
+      
         st.divider()
         st.markdown("**골드 슬롯(코호트별)**")
         st.checkbox("에픽 카드(영구) 구매", key=k(cohort, "epic_card_on"))
@@ -854,7 +891,9 @@ for cohort in COHORTS:
 
         st.divider()
         st.markdown("**자동 보정(코호트별)**")
-        st.caption(f"추천 목표: ratio(잔액/누적골드) = {TARGET_LOW:.0%} ~ {TARGET_HIGH:.0%}")
+        low = float(st.session_state["target_low"])
+        high = float(st.session_state["target_high"])
+        st.caption(f"추천 목표: ratio(잔액/누적골드) = {low:.0%} ~ {high:.0%}")
         if st.button(f"{cohort} 추천 XP 배율 계산", key=k(cohort, "btn_reco")):
             scenario, chosen = recommend_auto_multiplier_for_cohort(cohort)
             st.session_state[k(cohort, "auto_reco_info")] = None
@@ -906,18 +945,23 @@ def render_result(cohort: str, title: str, sim: Dict[str, Any], auto_mult: float
     kpis[4].metric("누적 Gold(수급)", f"{final['gold']:,}")
     kpis[5].metric("목표 판정", status_badge(target_label))
 
+    low = float(st.session_state["target_low"])
+    high = float(st.session_state["target_high"])
     st.caption(
         f"코호트: {cohort} | 목표 시나리오: {scenario_target} | "
-        f"추천 목표 ratio: {TARGET_LOW:.0%}~{TARGET_HIGH:.0%} | "
+        f"추천 목표 ratio: {low:.0%}~{high:.0%} | "
         f"현재 ratio: {target_ratio:.2%} | "
     )
-    manual_mult = xp_boost_N if manual_on else 1.0
-    final_xp_mult = auto_mult * manual_mult
+    # 실제 적용: manual_on 탭이면서, 해당 코호트가 sweep_card_on일 때만
+    sweep_on = bool(st.session_state[k(cohort, "sweep_card_on")])
+    manual_mult = (float(st.session_state["xp_boost_N"]) if (manual_on and sweep_on) else 1.0)
+    final_xp_mult = float(auto_mult) * manual_mult
+
     st.caption(
         f"XP 배율 구성 | "
         f"추천값 보정: {auto_mult:.3f}x | "
-        f"추가 XP: {xp_boost_N:.2f}x({'ON' if manual_on else 'OFF'}) | "
-    f"최종 적용: {final_xp_mult:.2f}x"
+        f"추가 XP(소탕카드 유저만): {manual_mult:.2f}x | "
+        f"최종 적용: {final_xp_mult:.2f}x"
     )
 
 
