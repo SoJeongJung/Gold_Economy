@@ -1,21 +1,21 @@
 # stageStat.py
 # Streamlit app: Stage clear combat power + power contributions (equip/rune/agency/equip-level)
 #
-# 유지(기존 UI/구조 최대한 유지):
-# - equips/runes: ID가 아니라 "name" 중심으로 표시 (id는 검증용 유지)
-# - gap_total_minus_calc / gap_label 유지
-# - 표 칼럼 표시 설정(전체/유저별) 유지
-# - 그래프/탭 구성 유지
+# 이번 수정(요청 반영):
+# 1) 룩업 CSV 1(Agency) 구조 변경
+#    - 컬럼: agencyLv, agencyAtk, agencyHp
+#    - agency_power = agencyAtk*4 + agencyHp 로 계산
+#    - agencyAtk/agencyHp 를 스냅샷 row에 저장 (옵션 계산에 사용)
+# 2) 옵션 계산(optionAtk/optionHp) 시 "agencyAtk/agencyHp"를 합산에 포함
+#    - optionAtk_power_total = ( (equip_atk + rune_atk + agencyAtk) * sum(optionAtk%) ) * 4
+#    - optionHp_power_total  = ( (equip_hp  + rune_hp  + agencyHp ) * sum(optionHp%) )
 #
-# 이번 반영:
-# 1) optionAtk / optionHp / optionAtkBase / optionHpBase 퍼센트 파싱 개선 (0으로 떨어지는 문제 해결)
-#    - "5%" -> 0.05
-#    - "5"  -> 0.05
-#    - 0.05 -> 0.05
-# 2) item lookup CSV에 gradeType 컬럼 추가 지원
-# 3) 스테이지별 최빈 grade 도출:
-#    - top_gear_grade: 해당 stage의 모든 유저 스냅샷에서 equips의 gradeType 최빈
-#    - top_rune_grade: 해당 stage의 모든 유저 스냅샷에서 runes의 gradeType 최빈
+# 유지(기존 UI/구조 최대한 유지):
+# - equips/runes: name 중심 표시 (id는 검증용 유지)
+# - gap_total_minus_calc / gap_label
+# - 표 칼럼 표시 설정(전체/유저별)
+# - 탭 구성
+# - gradeType 최빈(스테이지 평균)도 유지
 #
 # 실행:
 #   python3 -m streamlit run stageStat.py
@@ -136,18 +136,12 @@ def _to_ratio_percent(x) -> float:
     if has_pct:
         return v / 100.0
 
-    # 퍼센트 표기가 없을 때:
-    # 0~1이면 이미 비율로 판단, 1보다 크면 퍼센트(5 -> 5%)
     if 0.0 <= v <= 1.0:
         return v
     return v / 100.0
 
 
 def _mode_from_list_series(series: pd.Series) -> str:
-    """
-    series: 각 row가 list를 들고있는 Series (예: equips_grades)
-    모든 리스트를 flatten 후 최빈값 반환. 없으면 "".
-    """
     vals: List[str] = []
     for x in series:
         if isinstance(x, list):
@@ -158,6 +152,9 @@ def _mode_from_list_series(series: pd.Series) -> str:
     return c.most_common(1)[0][0]
 
 
+# =========================
+# Data models
+# =========================
 @dataclass
 class ItemRow:
     id: str
@@ -175,6 +172,20 @@ class ItemRow:
     gradeType: str
 
 
+@dataclass
+class AgencyRow:
+    agencyLv: int
+    agencyAtk: float
+    agencyHp: float
+
+    @property
+    def agencyPower(self) -> float:
+        return self.agencyAtk * 4.0 + self.agencyHp
+
+
+# =========================
+# Loaders
+# =========================
 def load_item_lookup(item_file) -> Dict[str, ItemRow]:
     df = pd.read_csv(item_file)
     df = _clean_cols(df)
@@ -229,20 +240,34 @@ def load_item_lookup(item_file) -> Dict[str, ItemRow]:
     return out
 
 
-def load_agency_lookup(agency_file) -> Dict[int, float]:
+def load_agency_lookup(agency_file) -> Dict[int, AgencyRow]:
+    """
+    룩업 CSV 1 (Agency)
+      - agencyLv, agencyAtk, agencyHp
+    """
     df = pd.read_csv(agency_file)
     df = _clean_cols(df)
 
-    lvl_col = _get_col(df, "lvl", "level", "agency_lv", "agency_level")
-    pwr_col = _get_col(df, "agency_power", "power")
-    if lvl_col is None or pwr_col is None:
-        raise ValueError("Agency lookup CSV must include columns: lvl, agency_power")
+    lv_col = _get_col(df, "agencyLv", "agencylev", "agency_lv", "lvl", "level")
+    atk_col = _get_col(df, "agencyAtk", "agency_atk", "atk")
+    hp_col = _get_col(df, "agencyHp", "agency_hp", "hp")
+    if lv_col is None or atk_col is None or hp_col is None:
+        raise ValueError("Agency lookup CSV must include columns: agencyLv, agencyAtk, agencyHp")
 
-    df["lvl_i"] = df[lvl_col].apply(_to_int)
-    df["pwr_f"] = df[pwr_col].apply(_to_float)
-    return dict(zip(df["lvl_i"], df["pwr_f"]))
+    df["lv_i"] = df[lv_col].apply(_to_int)
+    df["atk_f"] = df[atk_col].apply(_to_float)
+    df["hp_f"] = df[hp_col].apply(_to_float)
+
+    out: Dict[int, AgencyRow] = {}
+    for _, r in df.iterrows():
+        lv = int(r["lv_i"])
+        out[lv] = AgencyRow(agencyLv=lv, agencyAtk=float(r["atk_f"]), agencyHp=float(r["hp_f"]))
+    return out
 
 
+# =========================
+# Power calc
+# =========================
 def calc_item_power(item: ItemRow, slot_lv: int, is_equip: bool) -> Tuple[float, float, float]:
     """
     Returns (atk_calc, hp_calc, power)
@@ -266,7 +291,10 @@ def sum_equip_rune_power(
     slot_lv_by_type_id: Dict[int, int],
     slotType_to_type_id: Dict[str, int],
     item_map: Dict[str, ItemRow],
+    agency_atk: float,
+    agency_hp: float,
 ) -> Tuple[
+    float, float, float, float,
     float, float, float, float,
     float, float, float, float,
     List[str], List[str],
@@ -276,6 +304,7 @@ def sum_equip_rune_power(
     Returns:
       equip_power, rune_power, equip_base_power, equip_level_power,
       optionAtk_power_total, optionHp_power_total, optionAtk_power_self, optionHp_power_self,
+      equip_atk_sum, equip_hp_sum, rune_atk_sum, rune_hp_sum,
       equip_names, rune_names,
       equip_grades, rune_grades
     """
@@ -288,8 +317,10 @@ def sum_equip_rune_power(
     equip_grades: List[str] = []
     rune_grades: List[str] = []
 
-    total_atk_pre_option = 0.0
-    total_hp_pre_option = 0.0
+    equip_atk_sum = 0.0
+    equip_hp_sum = 0.0
+    rune_atk_sum = 0.0
+    rune_hp_sum = 0.0
 
     optionAtk_pct_sum = 0.0  # ratio(0~1) 합
     optionHp_pct_sum = 0.0
@@ -297,6 +328,7 @@ def sum_equip_rune_power(
     optionAtk_power_self = 0.0
     optionHp_power_self = 0.0
 
+    # ---- equips
     for eid in equip_ids:
         it = item_map.get(str(eid))
         if not it:
@@ -316,17 +348,20 @@ def sum_equip_rune_power(
         equip_power += p
         equip_base_power += base
 
-        total_atk_pre_option += atk
-        total_hp_pre_option += hp
+        equip_atk_sum += atk
+        equip_hp_sum += hp
 
+        # 총합 기준 옵션% 누적(장비)
         optionAtk_pct_sum += it.optionAtk
         optionHp_pct_sum += it.optionHp
 
+        # 장비 "자기 자신" 기준 옵션
         if it.optionAtkBase:
             optionAtk_power_self += (atk * it.optionAtkBase) * 4.0
         if it.optionHpBase:
             optionHp_power_self += (hp * it.optionHpBase)
 
+    # ---- runes
     for rid in rune_ids:
         it = item_map.get(str(rid))
         if not it:
@@ -340,13 +375,18 @@ def sum_equip_rune_power(
         atk, hp, p = calc_item_power(it, 0, is_equip=False)
         rune_power += p
 
-        total_atk_pre_option += atk
-        total_hp_pre_option += hp
+        rune_atk_sum += atk
+        rune_hp_sum += hp
 
+        # 총합 기준 옵션% 누적(룬)
         optionAtk_pct_sum += it.optionAtk
         optionHp_pct_sum += it.optionHp
 
     equip_level_power = equip_power - equip_base_power
+
+    # ---- total option base (요청 반영: agencyAtk/agencyHp 포함)
+    total_atk_pre_option = equip_atk_sum + rune_atk_sum + float(agency_atk)
+    total_hp_pre_option = equip_hp_sum + rune_hp_sum + float(agency_hp)
 
     optionAtk_power_total = (total_atk_pre_option * optionAtk_pct_sum) * 4.0
     optionHp_power_total = (total_hp_pre_option * optionHp_pct_sum)
@@ -360,6 +400,10 @@ def sum_equip_rune_power(
         optionHp_power_total,
         optionAtk_power_self,
         optionHp_power_self,
+        equip_atk_sum,
+        equip_hp_sum,
+        rune_atk_sum,
+        rune_hp_sum,
         equip_names,
         rune_names,
         equip_grades,
@@ -367,6 +411,9 @@ def sum_equip_rune_power(
     )
 
 
+# =========================
+# Parse user CSV
+# =========================
 def parse_user_csv(user_file) -> pd.DataFrame:
     df = pd.read_csv(user_file)
     df = _clean_cols(df)
@@ -380,7 +427,7 @@ def parse_user_csv(user_file) -> pd.DataFrame:
     game_state_col = _get_col(df, "game_state", "Game State")
     slot_lv_col = _get_col(df, "slot_lv", "slot level")
     slot_type_col = _get_col(df, "slot_type", "slotType", "slot type")
-    agency_lv_col = _get_col(df, "agency_lv", "agency level")
+    agency_lv_col = _get_col(df, "agency_lv", "agencyLv", "agency level")
 
     if ev_col is None or time_col is None:
         raise ValueError("User CSV must include at least: Event Name, Time")
@@ -432,10 +479,13 @@ def slot_levels_to_columns(slot_lv_by_type_id: Dict[int, int]) -> Dict[str, int]
     return out
 
 
+# =========================
+# Build snapshots
+# =========================
 def build_stage_rows_for_user(
     df: pd.DataFrame,
     user_label: str,
-    agency_power_map: Dict[int, float],
+    agency_map: Dict[int, AgencyRow],
     slotType_to_type_id: Dict[str, int],
     item_map: Dict[str, ItemRow],
 ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
@@ -504,6 +554,12 @@ def build_stage_rows_for_user(
             stage_lv = int(r.get("stage_lv", 0) or 0)
             total_power = float(r.get("combat_power", 0.0) or 0.0)
 
+            # agency atk/hp/power
+            arow = agency_map.get(int(agency_lv_current))
+            agencyAtk = float(arow.agencyAtk) if arow else 0.0
+            agencyHp = float(arow.agencyHp) if arow else 0.0
+            agency_power = (agencyAtk * 4.0 + agencyHp)
+
             (
                 equip_power,
                 rune_power,
@@ -513,6 +569,10 @@ def build_stage_rows_for_user(
                 optionHp_power_total,
                 optionAtk_power_self,
                 optionHp_power_self,
+                equip_atk_sum,
+                equip_hp_sum,
+                rune_atk_sum,
+                rune_hp_sum,
                 equip_names,
                 rune_names,
                 equip_grades,
@@ -523,9 +583,9 @@ def build_stage_rows_for_user(
                 slot_lv_by_type_id=slot_lv_by_type_id,
                 slotType_to_type_id=slotType_to_type_id,
                 item_map=item_map,
+                agency_atk=agencyAtk,
+                agency_hp=agencyHp,
             )
-
-            agency_power = float(agency_power_map.get(int(agency_lv_current), 0.0))
 
             row = {
                 "user": user_label,
@@ -533,18 +593,30 @@ def build_stage_rows_for_user(
                 "stage_lv": stage_lv,
                 "stage_id": str(r.get("stage_id", "")),
                 "total_power": total_power,
+
                 "equip_power": equip_power,
                 "rune_power": rune_power,
+
                 "agency_lv": int(agency_lv_current),
+                "agencyAtk": agencyAtk,
+                "agencyHp": agencyHp,
                 "agency_power": agency_power,
+
                 "equip_base_power": equip_base_power,
                 "equip_level_power": equip_level_power,
+
+                "equip_atk_sum": equip_atk_sum,
+                "equip_hp_sum": equip_hp_sum,
+                "rune_atk_sum": rune_atk_sum,
+                "rune_hp_sum": rune_hp_sum,
+
                 "equips_ids": equips,
                 "runes_ids": runes,
                 "equips_names": equip_names,
                 "runes_names": rune_names,
                 "equips_grades": equip_grades,
                 "runes_grades": rune_grades,
+
                 "optionAtk_power_total": optionAtk_power_total,
                 "optionHp_power_total": optionHp_power_total,
                 "optionAtk_power_self": optionAtk_power_self,
@@ -690,13 +762,13 @@ with st.sidebar:
     )
 
     agency_lookup_file = st.file_uploader(
-        "룩업 CSV 1 (Agency) — 컬럼: lvl, agency_power",
+        "룩업 CSV 1 (Agency) — 컬럼: agencyLv, agencyAtk, agencyHp",
         type=["csv"],
         accept_multiple_files=False,
     )
 
     item_lookup_file = st.file_uploader(
-        "룩업 CSV 2 (Items: Equip+Rune) — 컬럼: id, name, slotType, atkBase, atkInc, hpBase, hpInc, optionAtk, optionHp, optionAtkBase, optionHpBase, gradeType",
+        "룩업 CSV 2 (Items: Equip+Rune) — 컬럼: id, name, slotType, atkBase, atkInc, hpBase, hpInc, option..., gradeType",
         type=["csv"],
         accept_multiple_files=False,
     )
@@ -705,8 +777,6 @@ with st.sidebar:
     st.subheader("slotType 매핑")
     st.caption("Item.slotType 문자열 → 유저 CSV의 slot_type(1~6)로 매핑")
 
-    # 요청 반영: 기본 slotType + 매핑(편집 가능 유지)
-    # Hat, Coat, Ring, Neck, Belt, Boots => 1~6
     default_slotType_mapping = {
         "Hat": 1,
         "Coat": 2,
@@ -740,14 +810,14 @@ if not user_files:
     st.info("왼쪽에서 유저 CSV(1개 이상)를 업로드하세요.")
     st.stop()
 if agency_lookup_file is None:
-    st.info("왼쪽에서 Agency 룩업 CSV(lvl, agency_power)를 업로드하세요.")
+    st.info("왼쪽에서 Agency 룩업 CSV(agencyLv, agencyAtk, agencyHp)를 업로드하세요.")
     st.stop()
 if item_lookup_file is None:
-    st.info("왼쪽에서 Item 룩업 CSV(id, name, slotType, atkBase, atkInc, hpBase, hpInc, option..., gradeType)를 업로드하세요.")
+    st.info("왼쪽에서 Item 룩업 CSV(id, name, slotType, ... option..., gradeType)를 업로드하세요.")
     st.stop()
 
 try:
-    agency_power_map = load_agency_lookup(agency_lookup_file)
+    agency_map = load_agency_lookup(agency_lookup_file)
     item_map = load_item_lookup(item_lookup_file)
 except Exception as e:
     st.error(f"룩업 파일 로딩 실패: {e}")
@@ -768,7 +838,7 @@ for f in user_files:
         stage_rows, vinfo = build_stage_rows_for_user(
             df=udf,
             user_label=user_label,
-            agency_power_map=agency_power_map,
+            agency_map=agency_map,
             slotType_to_type_id=slotType_to_type_id,
             item_map=item_map,
         )
@@ -850,9 +920,11 @@ with tab_overall:
             "지표",
             options=[
                 "total_power", "equip_power", "rune_power", "agency_power",
+                "agencyAtk", "agencyHp",
                 "equip_base_power", "equip_level_power",
                 "calc_sum_power", "gap_total_minus_calc",
-                "optionAtk_power_total", "optionHp_power_total", "optionAtk_power_self", "optionHp_power_self"
+                "optionAtk_power_total", "optionHp_power_total", "optionAtk_power_self", "optionHp_power_self",
+                "equip_atk_sum", "equip_hp_sum", "rune_atk_sum", "rune_hp_sum",
             ],
             index=0,
             key="overall_metric",
@@ -899,9 +971,11 @@ with tab_user:
             "지표",
             options=[
                 "total_power", "equip_power", "rune_power", "agency_power",
+                "agencyAtk", "agencyHp",
                 "equip_base_power", "equip_level_power",
                 "calc_sum_power", "gap_total_minus_calc",
-                "optionAtk_power_total", "optionHp_power_total", "optionAtk_power_self", "optionHp_power_self"
+                "optionAtk_power_total", "optionHp_power_total", "optionAtk_power_self", "optionHp_power_self",
+                "equip_atk_sum", "equip_hp_sum", "rune_atk_sum", "rune_hp_sum",
             ],
             index=0,
             key="user_metric",
@@ -941,7 +1015,7 @@ with tab_user:
     s1.metric("total_power(로그)", f"{snap['total_power']:.0f}")
     s2.metric("equip_power(계산)", f"{snap['equip_power']:.0f}")
     s3.metric("rune_power(계산)", f"{snap['rune_power']:.0f}")
-    s4.metric("agency_power(룩업)", f"{snap['agency_power']:.0f}")
+    s4.metric("agency_power(계산)", f"{snap['agency_power']:.0f}")
 
     s5, s6, s7, s8 = st.columns(4)
     s5.metric("calc_sum_power", f"{snap['calc_sum_power']:.0f}")
