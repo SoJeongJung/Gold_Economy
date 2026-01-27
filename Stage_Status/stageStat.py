@@ -1,3 +1,18 @@
+# stageStat.py
+# Streamlit app: Stage clear combat power + power contributions (equip/rune/agency/equip-level)
+#
+# ✅ 요구사항 반영(최소 변경 버전)
+# - slotType 기본 매핑: Hat/Coat/Ring/Neck/Belt/Boots -> 1..6 (편집 가능 유지)
+# - 옵션 계산 포함
+# - "전체/유저별/스테이지 평균" 탭에서
+#   6개 전투력(전체/장비/룬/장비레벨/에이전시/그외옵션)을 "하나의 그래프"에서 함께 표시
+#   -> 범례 클릭으로 on/off 가능 (Plotly 기본)
+# - 그래프에서 유저는 "최종 스테이지 전체 전투력" 내림차순 정렬
+# - 색상(컬러)=전투력 종류, 유저는 line_dash로 구분(여러 유저 선택 시)
+#
+# 실행:
+#   python3 -m streamlit run stageStat.py
+
 import json
 import ast
 from dataclasses import dataclass
@@ -196,14 +211,9 @@ def sum_equip_rune_power(
       total_atk_pre_option, total_hp_pre_option,
       equip_names, rune_names
 
-    ✅ 옵션 토탈 정의(요구사항):
-      "룬 + 에이전시 + 장비 + 장비레벨"의 ATK/HP 합을 기준으로 % 적용
-      -> 여기서는 atk/hp 합을 구성할 때:
-         - 장비: (atkBase + atkInc*slot_lv), (hpBase + hpInc*slot_lv)
-         - 룬: atkBase, hpBase
-         - 에이전시: agency_power를 atk/hp로 환산해서 포함 (ratio는 UI에서 변경 가능)
+    옵션 토탈:
+      (룬 + 에이전시환산 + 장비(레벨반영))의 ATK/HP 합 기준으로 optionAtk/optionHp(%) 적용
     """
-
     equip_power = 0.0
     equip_base_power = 0.0
     rune_power = 0.0
@@ -215,7 +225,7 @@ def sum_equip_rune_power(
     agency_atk = float(agency_power) * float(agency_atk_ratio)
     agency_hp = float(agency_power) * float(agency_hp_ratio)
 
-    # 옵션 적용 직전 총합(요구사항 기준)
+    # 옵션 적용 직전 총합
     total_atk_pre_option = agency_atk
     total_hp_pre_option = agency_hp
 
@@ -244,15 +254,12 @@ def sum_equip_rune_power(
         equip_power += p
         equip_base_power += base
 
-        # 옵션 토탈 기준 합산에 포함
         total_atk_pre_option += atk
         total_hp_pre_option += hp
 
-        # 총합 기준 옵션% 누적
         optionAtk_pct_sum += (it.optionAtk / 100.0)
         optionHp_pct_sum += (it.optionHp / 100.0)
 
-        # 장비 개별 스탯 기준 옵션
         if it.optionAtkBase:
             optionAtk_power_self_raw += (atk * (it.optionAtkBase / 100.0)) * 4.0
         if it.optionHpBase:
@@ -269,19 +276,14 @@ def sum_equip_rune_power(
         atk, hp, p = calc_item_power(it, 0, is_equip=False)
         rune_power += p
 
-        # 옵션 토탈 기준 합산에 포함
         total_atk_pre_option += atk
         total_hp_pre_option += hp
 
-        # 총합 기준 옵션% 누적 (룬도 optionAtk/optionHp를 갖는다면 포함)
         optionAtk_pct_sum += (it.optionAtk / 100.0)
         optionHp_pct_sum += (it.optionHp / 100.0)
 
-        # 룬은 optionAtkBase/optionHpBase 없음(있어도 무시)
-
     equip_level_power = equip_power - equip_base_power
 
-    # 총합 기준 옵션 전투력
     optionAtk_power_total_raw = (total_atk_pre_option * optionAtk_pct_sum) * 4.0
     optionHp_power_total_raw = (total_hp_pre_option * optionHp_pct_sum)
 
@@ -556,7 +558,7 @@ def build_breakdown_tables_for_snapshot(
 
         equip_rows.append({
             "name": it.name,
-            "equip_id": it.id,  # 검증용 유지
+            "equip_id": it.id,
             "slotType": it.slotType,
             "slot_type_id": type_id,
             "slot_lv": lv,
@@ -594,7 +596,7 @@ def build_breakdown_tables_for_snapshot(
         atk, hp, p = calc_item_power(it, 0, is_equip=False)
         rune_rows.append({
             "name": it.name,
-            "rune_id": it.id,  # 검증용 유지
+            "rune_id": it.id,
             "slotType": it.slotType,
             "atk": atk,
             "hp": hp,
@@ -616,9 +618,6 @@ def names_join(xs: Any) -> str:
 
 
 def sort_users_by_latest_total_power(df_snap: pd.DataFrame) -> List[str]:
-    """
-    유저 정렬: 각 유저의 '가장 마지막 stage_lv'에서 total_power가 큰 순
-    """
     if df_snap.empty:
         return []
     tmp = df_snap.sort_values(["user", "stage_lv", "time"])
@@ -627,31 +626,41 @@ def sort_users_by_latest_total_power(df_snap: pd.DataFrame) -> List[str]:
     return last_rows["user"].tolist()
 
 
+# ✅ FIX: avg/overall/user 모두 지원하도록 분기
 def build_power_long_df(df_snap: pd.DataFrame, mode: str) -> Tuple[pd.DataFrame, Dict[str, str]]:
     """
     df_snap -> long format
     mode:
-      - "overall" or "user" : stage_lv 기준 라인차트
-      - "avg"              : stage_lv 기준 평균 라인차트 (user 컬럼 없음)
+      - "overall" or "user" : stage_lv 기준 라인차트 (user 포함)
+      - "avg"              : stage_lv 기준 평균 라인차트 (user 없음)
+
+    동작:
+    - df_snap에 equip_power_total/other_power가 이미 있으면 그대로 사용
+    - 없으면(df_all 같은 원본) option 컬럼로부터 계산해서 생성
     """
     df = df_snap.copy()
 
-    # 장비 옵션 전투력(대략)
-    df["equip_option_power"] = (
-        df["optionAtk_power_total"]
-        + df["optionHp_power_total"]
-        + df["optionAtk_power_self"]
-        + df["optionHp_power_self"]
-    )
+    # (1) equip_power_total / other_power가 없으면 생성(원본 df_all 대응)
+    if "equip_power_total" not in df.columns:
+        # 옵션 컬럼이 있으면 사용, 없으면 0 처리(안전)
+        opt_cols = ["optionAtk_power_total", "optionHp_power_total", "optionAtk_power_self", "optionHp_power_self"]
+        for c in opt_cols:
+            if c not in df.columns:
+                df[c] = 0
 
-    # 장비 전투력(요구사항): "장비 파워에는 옵션 셀프/토탈이 합쳐진거"
-    df["equip_power_total"] = df["equip_power"] + df["equip_option_power"]
+        df["equip_option_power"] = df["optionAtk_power_total"] + df["optionHp_power_total"] + df["optionAtk_power_self"] + df["optionHp_power_self"]
+        if "equip_power" not in df.columns:
+            df["equip_power"] = 0
+        df["equip_power_total"] = df["equip_power"] + df["equip_option_power"]
 
-    # 그 외 옵션 전투력 = 전체 - (장비(옵션포함) + 룬 + 에이전시)
-    # (여기엔 다른 시스템/버프/기타 원인이 들어갈 수 있음)
-    df["other_power"] = df["total_power"] - (df["equip_power_total"] + df["rune_power"] + df["agency_power"])
+    if "other_power" not in df.columns:
+        # total - (equip_total + rune + agency)
+        for c in ["total_power", "rune_power", "agency_power"]:
+            if c not in df.columns:
+                df[c] = 0
+        df["other_power"] = df["total_power"] - (df["equip_power_total"] + df["rune_power"] + df["agency_power"])
 
-    # 표시명(그래프 범례용)
+    # 표시명
     label_map = {
         "total_power": "전체 전투력",
         "equip_power_total": "장비 전투력",
@@ -662,11 +671,16 @@ def build_power_long_df(df_snap: pd.DataFrame, mode: str) -> Tuple[pd.DataFrame,
     }
 
     metrics = list(label_map.keys())
-    cols = ["stage_lv"] + (["user"] if mode in ("overall", "user") else []) + metrics
+    id_vars = ["stage_lv"] + (["user"] if mode in ("overall", "user") else [])
+
+    cols = id_vars + metrics
+    for c in cols:
+        if c not in df.columns:
+            df[c] = 0
     df = df[cols].copy()
 
     long_df = df.melt(
-        id_vars=["stage_lv"] + (["user"] if mode in ("overall", "user") else []),
+        id_vars=id_vars,
         value_vars=metrics,
         var_name="metric_key",
         value_name="value",
@@ -721,7 +735,6 @@ with st.sidebar:
     st.subheader("slotType 매핑")
     st.caption("Item.slotType 문자열 → 유저 CSV의 slot_type(1~6)로 매핑 (편집 가능 유지)")
 
-    # ✅ 요청한 기본 매핑
     default_slotType_mapping = {
         "Hat": 1,
         "Coat": 2,
@@ -807,10 +820,8 @@ if not all_rows:
 
 df_all = pd.concat(all_rows, ignore_index=True)
 
-# Stage range filter
 df_all = df_all[(df_all["stage_lv"] >= 1) & (df_all["stage_lv"] <= int(max_stage))].copy()
 
-# Derived sums + gap label (옵션 포함 합산 유지)
 df_all["calc_sum_power"] = (
     df_all["equip_power"]
     + df_all["rune_power"]
@@ -834,15 +845,12 @@ def _gap_label(g: float) -> str:
 
 df_all["gap_label"] = df_all["gap_total_minus_calc"].apply(_gap_label)
 
-# Name-based list strings for tables
 df_all["equips"] = df_all["equips_names"].apply(names_join)
 df_all["runes"] = df_all["runes_names"].apply(names_join)
 
-# Keep ID strings too (for debugging)
 df_all["equips_ids_str"] = df_all["equips_ids"].apply(names_join)
 df_all["runes_ids_str"] = df_all["runes_ids"].apply(names_join)
 
-# ✅ 유저 정렬(최종 stage 기준 total_power 내림차순)
 users_sorted = sort_users_by_latest_total_power(df_all)
 
 
@@ -853,7 +861,7 @@ tab_overall, tab_user, tab_avg, tab_validate = st.tabs(["전체(그래프)", "�
 
 
 # -------------------------
-# Tab: Overall graphs + full table
+# Tab: Overall
 # -------------------------
 with tab_overall:
     c1, c2, c3 = st.columns([1, 1, 2])
@@ -868,15 +876,14 @@ with tab_overall:
     if users_sel:
         view = view[view["user"].isin(users_sel)].copy()
 
-    # ✅ 하나의 그래프에 6개 전투력 표시 (색=전투력 종류, 유저는 dash)
     long_df, _ = build_power_long_df(view, mode="overall")
 
     fig = px.line(
         long_df.sort_values(["user", "stage_lv"]),
         x="stage_lv",
         y="value",
-        color="metric",          # ✅ 컬러=전투력 종류(범례에서 on/off)
-        line_dash="user",        # ✅ 유저는 선스타일로 구분
+        color="metric",
+        line_dash="user",
         category_orders={
             "user": users_sorted,
             "metric": [
@@ -904,7 +911,7 @@ with tab_overall:
 
 
 # -------------------------
-# Tab: Per-user graphs + deep breakdown
+# Tab: Per-user
 # -------------------------
 with tab_user:
     users = users_sorted if users_sorted else sorted(df_all["user"].unique())
@@ -923,7 +930,6 @@ with tab_user:
             key="user_stage_focus",
         )
 
-    # ✅ 하나의 그래프에 6개 전투력 표시 (유저 1명이라 dash 불필요)
     long_u, _ = build_power_long_df(udf, mode="user")
     fig2 = px.line(
         long_u.sort_values(["stage_lv"]),
@@ -957,7 +963,6 @@ with tab_user:
         item_map=item_map,
     )
 
-    # Inline metrics
     s1, s2, s3, s4 = st.columns(4)
     s1.metric("total_power(로그)", f"{snap['total_power']:.0f}")
     s2.metric("equip_power(계산)", f"{snap['equip_power']:.0f}")
@@ -996,7 +1001,7 @@ with tab_user:
 # Tab: Stage average
 # -------------------------
 with tab_avg:
-    # 기존 집계는 유지하되, "6개 구성" 평균을 위해 필요한 값도 계산
+    # 평균 집계(기존 구조 유지 + 필요한 컬럼만 추가)
     tmp = df_all.copy()
     tmp["equip_option_power"] = (
         tmp["optionAtk_power_total"]
@@ -1024,8 +1029,9 @@ with tab_avg:
         .sort_values("stage_lv")
     )
 
-    # ✅ 평균도 하나의 그래프에 6개 구성 표시(토글 가능)
-    long_a, _ = build_power_long_df(agg.rename(columns={"user": "user"}), mode="avg")
+    # ✅ 여기서 KeyError 안 남 (agg는 이미 equip_power_total/other_power를 가짐)
+    long_a, _ = build_power_long_df(agg, mode="avg")
+
     fig3 = px.line(
         long_a.sort_values(["stage_lv"]),
         x="stage_lv",
