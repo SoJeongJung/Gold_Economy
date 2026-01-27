@@ -1,29 +1,29 @@
 # stageStat.py
-# Streamlit app: Stage clear combat power + power contributions (equip/rune/agency/equip-level + options + passive)
+# Streamlit app: Stage clear combat power + power contributions
 #
 # 이번 수정(요청 반영):
-# 1) "전체/유저별" 그래프: 스테이지별 컨텐츠 전투력 "비중(%)"을 한 그래프(누적 area)로 표시
-#    - 기본(옵션 합침): 6개 컨텐츠 (패시브/에이전시/캐릭터/장비/룬/슬롯레벨)
-#      * 장비에는 (장비옵션 + 룬옵션)을 합쳐서 포함
-#    - 옵션 분리 체크 시: 8개 컨텐츠 (패시브/에이전시/캐릭터/장비/룬/슬롯레벨/(장비옵션)/(룬옵션))
-#      * 이때 "장비"는 옵션 빠진 순수 장비(베이스)만 표시
-# 2) 유저별 탭: 패시브 제외 나머지 컨텐츠 계산 검증용 상세 테이블(기존처럼) 유지
-# 3) gap_total_minus_calc / gap_label 제거 (차이는 passive로 처리)
-# 4) Stage 평균/데이터 오류 검증 탭은 유지(컬럼만 새 계산식 기반으로 갱신)
+# 1) passive_power / character_power 음수 방지
+#    - characterAtk/Hp는 입력에서 0 이상(기존) + 계산 결과도 음수 불가
+#    - passive_power = max(0, total_power - non_passive_sum) 로 클램프
+#      (계산이 total을 초과하는 경우 passive는 0으로 고정)
+#
+# 2) 전체(그래프) 탭:
+#    - "전투력(절대값)" ↔ "비중(%)" 토글 제공
+#    - 전투력(절대값) 모드: 이전처럼 "토탈 평균 전투력 + 컨텐츠별 전투력"을 한 그래프(멀티라인)로 표시
+#    - 비중(%) 모드: 누적 area(%)로 표시
+#    - 옵션 분리 보기 유지(6개 ↔ 8개)
+#      * 기본(옵션 합침): 장비옵션은 장비, 룬옵션은 룬에 합쳐서 6개 컨텐츠로 표시
+#      * 옵션 분리: (장비 옵션)/(룬 옵션) 별도로 8개 컨텐츠 표시
+#
+# 3) 스테이지 평균 탭:
+#    - 장비 옵션은 장비 파워에, 룬 옵션은 룬 파워에 "합쳐서" 표시
+#    - 표의 소수점은 반올림(정수) 처리
+#    - 그래프는 기존처럼 선택 지표 1개 라인
 #
 # 룩업 CSV
 # - Agency 룩업 CSV 1: agencyLv, agencyAtk, agencyHp
 # - Item 룩업 CSV 2: id,name,slotType,atkBase,atkInc,hpBase,hpInc,optionAtk,optionHp,optionAtkBase,optionHpBase,gradeType
-#   * optionAtk/optionHp 는 %, 5 또는 5% 또는 0.05 모두 허용 (자동으로 ratio로 변환)
-#   * optionAtkBase/optionHpBase 는 "자기 자신" 기준 옵션(%) (장비만 적용)
-#
-# 옵션 계산(요약)
-# - 옵션 base(ATK/HP): (가정 패시브 ATK/HP) + agencyAtk/agencyHp + characterAtk/characterHp + equip_atk/hp + rune_atk/hp
-# - 장비옵션(total): base * (장착 장비들의 optionAtk/optionHp 합)
-# - 룬옵션(total):  base * (장착 룬들의 optionAtk/optionHp 합)
-# - 장비 self 옵션: 각 장비 스탯(atk/hp) * optionAtkBase/optionHpBase
-# - 전투력 환산: power = atk*4 + hp
-# - passive_power = total_power - (agency + character + gear_base + slotLv + rune_base + gear_option + rune_option)
+#   * optionAtk/optionHp: 5, "5%", 0.05 모두 허용(자동 ratio 변환)
 #
 # 실행:
 #   python3 -m streamlit run stageStat.py
@@ -148,6 +148,14 @@ def _to_ratio_percent(x) -> float:
     return v / 100.0
 
 
+def names_join(xs: Any) -> str:
+    if isinstance(xs, list):
+        return ", ".join([str(x) for x in xs])
+    if xs is None or (isinstance(xs, float) and np.isnan(xs)):
+        return ""
+    return str(xs)
+
+
 def _mode_from_list_series(series: pd.Series) -> str:
     vals: List[str] = []
     for x in series:
@@ -159,12 +167,16 @@ def _mode_from_list_series(series: pd.Series) -> str:
     return c.most_common(1)[0][0]
 
 
-def names_join(xs: Any) -> str:
-    if isinstance(xs, list):
-        return ", ".join([str(x) for x in xs])
-    if xs is None or (isinstance(xs, float) and np.isnan(xs)):
-        return ""
-    return str(xs)
+def _order_components_by_last_value(long_df: pd.DataFrame, label_col: str, x_col: str, y_col: str) -> List[str]:
+    """
+    legend(카테고리) 순서를 마지막 x 지점의 y 값 큰 순으로 정렬.
+    """
+    if long_df.empty:
+        return []
+    last_x = long_df[x_col].max()
+    tmp = long_df[long_df[x_col] == last_x].groupby(label_col, as_index=False)[y_col].sum()
+    tmp = tmp.sort_values(y_col, ascending=False)
+    return tmp[label_col].tolist()
 
 
 # =========================
@@ -217,7 +229,6 @@ def load_item_lookup(item_file) -> Dict[str, ItemRow]:
         else:
             df[c] = pd.to_numeric(df[cc], errors="coerce").fillna(0)
 
-    # 옵션 컬럼 (없으면 0), ratio(0~1)로 통일
     for c in ["optionAtk", "optionHp", "optionAtkBase", "optionHpBase"]:
         cc = _get_col(df, c)
         if cc is None:
@@ -225,7 +236,6 @@ def load_item_lookup(item_file) -> Dict[str, ItemRow]:
         else:
             df[c] = df[cc].apply(_to_ratio_percent)
 
-    # gradeType (없으면 "")
     grade_col = _get_col(df, "gradeType", "gradetype", "grade_type")
     if grade_col is None:
         df["gradeType"] = ""
@@ -255,10 +265,6 @@ def load_item_lookup(item_file) -> Dict[str, ItemRow]:
 
 
 def load_agency_lookup(agency_file) -> Dict[int, AgencyRow]:
-    """
-    룩업 CSV 1 (Agency)
-      - agencyLv, agencyAtk, agencyHp
-    """
     df = pd.read_csv(agency_file)
     df = _clean_cols(df)
 
@@ -276,6 +282,74 @@ def load_agency_lookup(agency_file) -> Dict[int, AgencyRow]:
     for _, r in df.iterrows():
         lv = int(r["lv_i"])
         out[lv] = AgencyRow(agencyLv=lv, agencyAtk=float(r["atk_f"]), agencyHp=float(r["hp_f"]))
+    return out
+
+
+# =========================
+# Parse user CSV
+# =========================
+def parse_user_csv(user_file) -> pd.DataFrame:
+    df = pd.read_csv(user_file)
+    df = _clean_cols(df)
+
+    ev_col = _get_col(df, "Event Name", "event", "event_name")
+    time_col = _get_col(df, "Time", "time")
+    did_col = _get_col(df, "Distinct ID", "distinct_id")
+    stage_lv_col = _get_col(df, "stage_lv", "Stage Lv", "stage level", "stage_lv ")
+    stage_id_col = _get_col(df, "stage_id", "Stage ID")
+    combat_col = _get_col(df, "combat_power", "combat power", "combatPower", "combat_power ")
+    game_state_col = _get_col(df, "game_state", "Game State")
+    slot_lv_col = _get_col(df, "slot_lv", "slot level")
+    slot_type_col = _get_col(df, "slot_type", "slotType", "slot type")
+    agency_lv_col = _get_col(df, "agency_lv", "agencyLv", "agency level")
+
+    if ev_col is None or time_col is None:
+        raise ValueError("User CSV must include at least: Event Name, Time")
+
+    keep = [
+        c for c in [
+            ev_col, time_col, did_col, stage_lv_col, stage_id_col, combat_col,
+            game_state_col, slot_lv_col, slot_type_col, agency_lv_col
+        ] if c is not None
+    ]
+    df = df[keep].copy()
+
+    df.rename(columns={
+        ev_col: "event_name",
+        time_col: "time",
+        (did_col or ""): "distinct_id",
+        (stage_lv_col or ""): "stage_lv",
+        (stage_id_col or ""): "stage_id",
+        (combat_col or ""): "combat_power",
+        (game_state_col or ""): "game_state",
+        (slot_lv_col or ""): "slot_lv",
+        (slot_type_col or ""): "slot_type",
+        (agency_lv_col or ""): "agency_lv",
+    }, inplace=True)
+
+    for c in ["distinct_id", "stage_lv", "stage_id", "combat_power", "game_state", "slot_lv", "slot_type", "agency_lv"]:
+        if c not in df.columns:
+            df[c] = np.nan
+
+    df["time"] = df["time"].apply(_to_float)
+    df["event_name"] = df["event_name"].astype(str)
+
+    df["stage_lv"] = df["stage_lv"].apply(_to_int)
+    df["combat_power"] = df["combat_power"].apply(_to_float)
+
+    df["slot_lv"] = df["slot_lv"].apply(_to_int)
+    df["slot_type"] = df["slot_type"].apply(_to_int)
+    df["agency_lv"] = df["agency_lv"].apply(_to_int)
+
+    df["_gs"] = df["game_state"].apply(_safe_json_loads)
+
+    return df.sort_values("time").reset_index(drop=True)
+
+
+def slot_levels_to_columns(slot_lv_by_type_id: Dict[int, int]) -> Dict[str, int]:
+    out = {}
+    for i in range(1, 7):
+        out[f"slot_lv_{i}"] = int(slot_lv_by_type_id.get(i, 0))
     return out
 
 
@@ -313,16 +387,11 @@ def sum_equip_rune_components(
     assumed_passiveHp_for_option: float,
 ) -> Dict[str, Any]:
     """
-    컨텐츠별 전투력 컴포넌트를 계산해서 dict로 반환.
-
-    반환 key(주요):
+    반환:
       - gear_base_power, slotLv_power, rune_base_power
-      - gear_option_power, rune_option_power
-      - option_gear_total_power, option_gear_self_power, option_rune_total_power
-      - gear_atk_sum, gear_hp_sum, rune_atk_sum, rune_hp_sum
-      - option_base_atk, option_base_hp
-      - equips_names/runes_names + equips_grades/runes_grades
-      - equip_df용: per-equip atk/hp/power 등은 상세 테이블에서 별도 계산(스냅샷 함수에서)
+      - gear_option_power(= gear_total + gear_self), rune_option_power(= rune_total)
+      - option_base_atk/hp, gear/rune atk/hp sums
+      - equips/runes names + grades
     """
     gear_base_power = 0.0
     slotLv_power = 0.0
@@ -431,7 +500,6 @@ def sum_equip_rune_components(
     # power 환산
     option_gear_total_power = option_gear_total_atk * 4.0 + option_gear_total_hp
     option_gear_self_power = (option_gear_self_atk * 4.0) + option_gear_self_hp
-
     option_rune_total_power = option_rune_total_atk * 4.0 + option_rune_total_hp
 
     gear_option_power = option_gear_total_power + option_gear_self_power
@@ -461,75 +529,12 @@ def sum_equip_rune_components(
         "runes_names": runes_names,
         "equips_grades": equips_grades,
         "runes_grades": runes_grades,
+
+        "gear_optAtk_pct_sum": gear_optAtk_pct_sum,
+        "gear_optHp_pct_sum": gear_optHp_pct_sum,
+        "rune_optAtk_pct_sum": rune_optAtk_pct_sum,
+        "rune_optHp_pct_sum": rune_optHp_pct_sum,
     }
-
-
-# =========================
-# Parse user CSV
-# =========================
-def parse_user_csv(user_file) -> pd.DataFrame:
-    df = pd.read_csv(user_file)
-    df = _clean_cols(df)
-
-    ev_col = _get_col(df, "Event Name", "event", "event_name")
-    time_col = _get_col(df, "Time", "time")
-    did_col = _get_col(df, "Distinct ID", "distinct_id")
-    stage_lv_col = _get_col(df, "stage_lv", "Stage Lv", "stage level", "stage_lv ")
-    stage_id_col = _get_col(df, "stage_id", "Stage ID")
-    combat_col = _get_col(df, "combat_power", "combat power", "combatPower", "combat_power ")
-    game_state_col = _get_col(df, "game_state", "Game State")
-    slot_lv_col = _get_col(df, "slot_lv", "slot level")
-    slot_type_col = _get_col(df, "slot_type", "slotType", "slot type")
-    agency_lv_col = _get_col(df, "agency_lv", "agencyLv", "agency level")
-
-    if ev_col is None or time_col is None:
-        raise ValueError("User CSV must include at least: Event Name, Time")
-
-    keep = [
-        c for c in [
-            ev_col, time_col, did_col, stage_lv_col, stage_id_col, combat_col,
-            game_state_col, slot_lv_col, slot_type_col, agency_lv_col
-        ] if c is not None
-    ]
-    df = df[keep].copy()
-
-    df.rename(columns={
-        ev_col: "event_name",
-        time_col: "time",
-        (did_col or ""): "distinct_id",
-        (stage_lv_col or ""): "stage_lv",
-        (stage_id_col or ""): "stage_id",
-        (combat_col or ""): "combat_power",
-        (game_state_col or ""): "game_state",
-        (slot_lv_col or ""): "slot_lv",
-        (slot_type_col or ""): "slot_type",
-        (agency_lv_col or ""): "agency_lv",
-    }, inplace=True)
-
-    for c in ["distinct_id", "stage_lv", "stage_id", "combat_power", "game_state", "slot_lv", "slot_type", "agency_lv"]:
-        if c not in df.columns:
-            df[c] = np.nan
-
-    df["time"] = df["time"].apply(_to_float)
-    df["event_name"] = df["event_name"].astype(str)
-
-    df["stage_lv"] = df["stage_lv"].apply(_to_int)
-    df["combat_power"] = df["combat_power"].apply(_to_float)
-
-    df["slot_lv"] = df["slot_lv"].apply(_to_int)
-    df["slot_type"] = df["slot_type"].apply(_to_int)
-    df["agency_lv"] = df["agency_lv"].apply(_to_int)
-
-    df["_gs"] = df["game_state"].apply(_safe_json_loads)
-
-    return df.sort_values("time").reset_index(drop=True)
-
-
-def slot_levels_to_columns(slot_lv_by_type_id: Dict[int, int]) -> Dict[str, int]:
-    out = {}
-    for i in range(1, 7):
-        out[f"slot_lv_{i}"] = int(slot_lv_by_type_id.get(i, 0))
-    return out
 
 
 # =========================
@@ -559,6 +564,7 @@ def build_stage_rows_for_user(
         "first_clear_rows": 0,
         "parsed_game_state_fail": 0,
         "stage_clear_rows_emitted": 0,
+        "passive_clamped_rows": 0,
     }
 
     for _, r in df.iterrows():
@@ -617,8 +623,10 @@ def build_stage_rows_for_user(
             agencyHp = float(arow.agencyHp) if arow else 0.0
             agency_power = (agencyAtk * 4.0 + agencyHp)
 
-            # character
-            character_power = float(characterAtk) * 4.0 + float(characterHp)
+            # character (음수 방지)
+            cAtk = max(0.0, float(characterAtk))
+            cHp = max(0.0, float(characterHp))
+            character_power = cAtk * 4.0 + cHp
 
             comps = sum_equip_rune_components(
                 equip_ids=equips,
@@ -628,14 +636,13 @@ def build_stage_rows_for_user(
                 item_map=item_map,
                 agencyAtk=agencyAtk,
                 agencyHp=agencyHp,
-                characterAtk=characterAtk,
-                characterHp=characterHp,
+                characterAtk=cAtk,
+                characterHp=cHp,
                 assumed_passiveAtk_for_option=assumed_passiveAtk_for_option,
                 assumed_passiveHp_for_option=assumed_passiveHp_for_option,
             )
 
-            # non-passive 합(=계산 가능한 요소 전투력)
-            calc_sum_power = (
+            non_passive_sum = (
                 agency_power
                 + character_power
                 + comps["gear_base_power"]
@@ -645,7 +652,15 @@ def build_stage_rows_for_user(
                 + comps["rune_option_power"]
             )
 
-            passive_power = float(total_power) - float(calc_sum_power)
+            passive_raw = float(total_power) - float(non_passive_sum)
+
+            # 음수 방지: passive는 0으로 클램프
+            passive_power = passive_raw
+            if passive_power < 0:
+                passive_power = 0.0
+                validation["passive_clamped_rows"] += 1
+
+            calc_sum_power = non_passive_sum + passive_power  # passive 포함(클램프 반영)
 
             row = {
                 "user": user_label,
@@ -661,8 +676,8 @@ def build_stage_rows_for_user(
                 "agency_power": agency_power,
 
                 # character
-                "characterAtk": float(characterAtk),
-                "characterHp": float(characterHp),
+                "characterAtk": cAtk,
+                "characterHp": cHp,
                 "character_power": character_power,
 
                 # gear/rune/slot + options
@@ -684,6 +699,11 @@ def build_stage_rows_for_user(
                 "option_base_atk": comps["option_base_atk"],
                 "option_base_hp": comps["option_base_hp"],
 
+                "gear_optAtk_pct_sum": comps["gear_optAtk_pct_sum"],
+                "gear_optHp_pct_sum": comps["gear_optHp_pct_sum"],
+                "rune_optAtk_pct_sum": comps["rune_optAtk_pct_sum"],
+                "rune_optHp_pct_sum": comps["rune_optHp_pct_sum"],
+
                 "equips_ids": equips,
                 "runes_ids": runes,
                 "equips_names": comps["equips_names"],
@@ -692,8 +712,10 @@ def build_stage_rows_for_user(
                 "runes_grades": comps["runes_grades"],
 
                 # sums
-                "calc_sum_power": calc_sum_power,
+                "non_passive_sum": non_passive_sum,
                 "passive_power": passive_power,
+                "calc_sum_power": calc_sum_power,
+                "passive_raw": passive_raw,  # 디버그용(표에서 숨길 수 있음)
             }
             row.update(slot_levels_to_columns(slot_lv_by_type_id))
             rows.append(row)
@@ -754,7 +776,7 @@ def build_breakdown_tables_for_snapshot(
         lv = slot_lv_by_type_id.get(int(type_id), 0) if type_id is not None else 0
 
         atk, hp, p = calc_item_power(it, lv, is_equip=True)
-        base_atk, base_hp, base_p = calc_item_power(it, 0, is_equip=True)
+        _, _, base_p = calc_item_power(it, 0, is_equip=True)
 
         equip_rows.append({
             "name": it.name,
@@ -813,115 +835,84 @@ def build_breakdown_tables_for_snapshot(
 
 
 # =========================
-# Graph helpers (composition)
+# Graph helpers (composition / absolute)
 # =========================
 LABELS = {
+    "total_power": "전체 전투력",
     "passive_power": "패시브",
     "agency_power": "에이전시",
     "character_power": "캐릭터",
-    "gear_base_power": "장비",
-    "rune_base_power": "룬",
+    "gear_power": "장비",
+    "rune_power": "룬",
     "slotLv_power": "슬롯 레벨",
     "gear_option_power": "(장비 옵션)",
     "rune_option_power": "(룬 옵션)",
-    "gear_merged_power": "장비",  # 옵션 합친 장비 표시용
+    "gear_base_power": "장비(옵션 제외)",
+    "rune_base_power": "룬(옵션 제외)",
 }
 
 
-def build_composition_long_df(df: pd.DataFrame, split_options: bool) -> pd.DataFrame:
-    """
-    df: stage_lv 단위로 이미 집계되어 있는 wide df (power columns 포함)
-    split_options:
-      - False: 6개 컨텐츠(옵션은 장비에 합쳐서)
-      - True : 8개 컨텐츠(옵션 분리)
-    """
-    base_cols = [
-        "passive_power",
-        "agency_power",
-        "character_power",
-        "gear_base_power",
-        "rune_base_power",
-        "slotLv_power",
-        "gear_option_power",
-        "rune_option_power",
+def build_stage_agg(df: pd.DataFrame) -> pd.DataFrame:
+    cols = [
+        "total_power",
+        "passive_power", "agency_power", "character_power",
+        "gear_base_power", "slotLv_power", "rune_base_power",
+        "gear_option_power", "rune_option_power",
+        "calc_sum_power",
     ]
-    for c in base_cols:
-        if c not in df.columns:
-            df[c] = 0.0
+    tmp = df.copy()
+    for c in cols:
+        if c not in tmp.columns:
+            tmp[c] = 0.0
+
+    stage_agg = (
+        tmp.groupby("stage_lv", as_index=False)[cols]
+        .mean()
+        .sort_values("stage_lv")
+    )
+    return stage_agg
+
+
+def build_long_for_plot(stage_agg: pd.DataFrame, split_options: bool, include_total: bool, mode: str) -> pd.DataFrame:
+    """
+    mode:
+      - "abs": 절대 전투력
+      - "pct": 비중(%) -> area groupnorm='percent'
+    split_options:
+      - False: 장비옵션은 장비에, 룬옵션은 룬에 합쳐서 6개(+total 옵션)
+      - True : 옵션을 별도 레이어로(8개 + total)
+    """
+    df = stage_agg.copy()
+
+    # merged powers (6개 보기)
+    df["gear_power"] = df["gear_base_power"].astype(float) + df["gear_option_power"].astype(float)
+    df["rune_power"] = df["rune_base_power"].astype(float) + df["rune_option_power"].astype(float)
 
     if split_options:
         comp_cols = [
-            "passive_power",
-            "agency_power",
-            "character_power",
-            "gear_base_power",
-            "rune_base_power",
-            "slotLv_power",
-            "gear_option_power",
-            "rune_option_power",
-        ]
-        out = df[["stage_lv"] + comp_cols].copy()
-        long = out.melt(id_vars=["stage_lv"], var_name="component", value_name="power")
-        long["component_label"] = long["component"].map(LABELS).fillna(long["component"])
-        return long
-
-    # 옵션 합침(장비로 이동): gear_merged = gear_base + gear_option + rune_option
-    tmp = df[["stage_lv", "passive_power", "agency_power", "character_power", "gear_base_power", "rune_base_power", "slotLv_power"]].copy()
-    tmp["gear_merged_power"] = (
-        df["gear_base_power"].astype(float)
-        + df["gear_option_power"].astype(float)
-        + df["rune_option_power"].astype(float)
-    )
-    # 기존 gear_base_power 대신 gear_merged_power를 사용
-    tmp = tmp.drop(columns=["gear_base_power"])
-    comp_cols = ["passive_power", "agency_power", "character_power", "gear_merged_power", "rune_base_power", "slotLv_power"]
-    long = tmp[["stage_lv"] + comp_cols].melt(id_vars=["stage_lv"], var_name="component", value_name="power")
-    long["component_label"] = long["component"].map(LABELS).fillna(long["component"])
-    return long
-
-
-def build_composition_table(df: pd.DataFrame, split_options: bool) -> pd.DataFrame:
-    """
-    스테이지별로 '컨텐츠 전투력 + 비중%' 테이블 생성 (wide).
-    """
-    # stage_lv 기준 집계 df 가 들어온다고 가정
-    # 각 component power 합계를 total로 나눠 pct 산출
-    if split_options:
-        cols = [
             "passive_power", "agency_power", "character_power",
             "gear_base_power", "rune_base_power", "slotLv_power",
             "gear_option_power", "rune_option_power",
         ]
     else:
-        # 옵션 합친 6개 구성
-        cols = [
+        comp_cols = [
             "passive_power", "agency_power", "character_power",
-            "gear_merged_power", "rune_base_power", "slotLv_power",
+            "gear_power", "rune_power", "slotLv_power",
         ]
 
-    df2 = df.copy()
-    if not split_options:
-        df2["gear_merged_power"] = (
-            df2.get("gear_base_power", 0.0).astype(float)
-            + df2.get("gear_option_power", 0.0).astype(float)
-            + df2.get("rune_option_power", 0.0).astype(float)
-        )
+    plot_cols = comp_cols.copy()
+    if include_total:
+        plot_cols = ["total_power"] + plot_cols
 
-    for c in cols:
-        if c not in df2.columns:
-            df2[c] = 0.0
+    long = df[["stage_lv"] + plot_cols].melt(id_vars=["stage_lv"], var_name="component", value_name="value")
+    long["label"] = long["component"].map(LABELS).fillna(long["component"])
 
-    df2["total_for_pct"] = df2[cols].sum(axis=1)
+    if mode == "pct":
+        # total 제외하고 비중을 보는 게 자연스러움
+        if include_total:
+            long = long[long["component"] != "total_power"].copy()
 
-    out = df2[["stage_lv"]].copy()
-    for c in cols:
-        out[f"{LABELS.get(c, c)}_power"] = df2[c].apply(lambda x: float(x))
-        out[f"{LABELS.get(c, c)}_%"] = df2.apply(
-            lambda r: (float(r[c]) / float(r["total_for_pct"]) * 100.0) if float(r["total_for_pct"]) > 0 else 0.0,
-            axis=1
-        )
-
-    return out
+    return long
 
 
 # =========================
@@ -1021,9 +1012,9 @@ errors = []
 for f in user_files:
     user_label = f.name.replace(".csv", "")
     try:
-        udf = parse_user_csv(f)
+        udf_raw = parse_user_csv(f)
         stage_rows, vinfo = build_stage_rows_for_user(
-            df=udf,
+            df=udf_raw,
             user_label=user_label,
             agency_map=agency_map,
             slotType_to_type_id=slotType_to_type_id,
@@ -1050,17 +1041,13 @@ if not all_rows:
     st.stop()
 
 df_all = pd.concat(all_rows, ignore_index=True)
-
-# Stage range filter
 df_all = df_all[(df_all["stage_lv"] >= 1) & (df_all["stage_lv"] <= int(max_stage))].copy()
 
-# Name-based list strings for tables
+# display-friendly strings
 df_all["equips"] = df_all["equips_names"].apply(names_join)
 df_all["runes"] = df_all["runes_names"].apply(names_join)
 df_all["equips_gradeTypes"] = df_all["equips_grades"].apply(names_join)
 df_all["runes_gradeTypes"] = df_all["runes_grades"].apply(names_join)
-
-# Keep ID strings too (for debugging)
 df_all["equips_ids_str"] = df_all["equips_ids"].apply(names_join)
 df_all["runes_ids_str"] = df_all["runes_ids"].apply(names_join)
 
@@ -1072,64 +1059,67 @@ tab_overall, tab_user, tab_avg, tab_validate = st.tabs(["전체(그래프)", "�
 
 
 # -------------------------
-# Tab: Overall (composition % + table)
+# Tab: Overall
 # -------------------------
 with tab_overall:
-    c1, c2, c3, c4 = st.columns([1, 1, 1, 2])
+    c1, c2, c3, c4, c5 = st.columns([1, 1, 1, 1, 2])
     with c1:
         stage_min = st.number_input("stage min", min_value=1, max_value=int(max_stage), value=1, step=1, key="overall_stage_min")
     with c2:
         stage_max = st.number_input("stage max", min_value=1, max_value=int(max_stage), value=int(max_stage), step=1, key="overall_stage_max")
     with c3:
-        split_options = st.checkbox("옵션 분리해서 보기(8개)", value=False, key="overall_split_options")
+        view_mode = st.selectbox("보기", options=["전투력(절대값)", "비중(%)"], index=0, key="overall_view_mode")
     with c4:
+        split_options = st.checkbox("옵션 분리(8개)", value=False, key="overall_split_options")
+    with c5:
         users_sel = st.multiselect("유저(선택 시 필터)", options=sorted(df_all["user"].unique()), default=[], key="overall_users")
 
     view = df_all[(df_all["stage_lv"] >= int(stage_min)) & (df_all["stage_lv"] <= int(stage_max))].copy()
     if users_sel:
         view = view[view["user"].isin(users_sel)].copy()
 
-    # 전체는 stage별 평균(유저 수가 다르면 합계보다 평균이 안정적)
-    agg_cols = [
-        "total_power",
-        "passive_power", "agency_power", "character_power",
-        "gear_base_power", "rune_base_power", "slotLv_power",
-        "gear_option_power", "rune_option_power",
-        "calc_sum_power",
-    ]
-    for c in agg_cols:
-        if c not in view.columns:
-            view[c] = 0.0
+    stage_agg = build_stage_agg(view)
 
-    stage_agg = (
-        view
-        .groupby("stage_lv", as_index=False)[agg_cols]
-        .mean()
-        .sort_values("stage_lv")
-    )
-
-    long = build_composition_long_df(stage_agg, split_options=split_options)
-
-    fig = px.area(
-        long,
-        x="stage_lv",
-        y="power",
-        color="component_label",
-        groupnorm="percent",
-        title="스테이지별 컨텐츠 전투력 비중(%)",
-    )
-    fig.update_layout(yaxis_title="비중(%)")
-    st.plotly_chart(fig, use_container_width=True)
+    if view_mode == "전투력(절대값)":
+        # total + components (6 or 8)
+        long_abs = build_long_for_plot(stage_agg, split_options=split_options, include_total=True, mode="abs")
+        order = _order_components_by_last_value(long_abs, "label", "stage_lv", "value")
+        fig = px.line(
+            long_abs,
+            x="stage_lv",
+            y="value",
+            color="label",
+            title="스테이지별 평균 전투력 (전체 + 컨텐츠별)",
+            category_orders={"label": order} if order else None,
+        )
+        fig.update_layout(yaxis_title="전투력(평균)")
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        # composition %
+        long_pct = build_long_for_plot(stage_agg, split_options=split_options, include_total=False, mode="pct")
+        order = _order_components_by_last_value(long_pct, "label", "stage_lv", "value")
+        fig = px.area(
+            long_pct,
+            x="stage_lv",
+            y="value",
+            color="label",
+            groupnorm="percent",
+            title="스테이지별 컨텐츠 전투력 비중(%)",
+            category_orders={"label": order} if order else None,
+        )
+        fig.update_layout(yaxis_title="비중(%)")
+        st.plotly_chart(fig, use_container_width=True)
 
     st.divider()
-
-    st.subheader("스테이지별 컨텐츠 전투력/비중 테이블")
-    tbl = build_composition_table(stage_agg, split_options=split_options)
-    st.dataframe(tbl, use_container_width=True, height=520)
+    st.subheader("전체 테이블 (유저×스테이지 스냅샷)")
+    with st.expander("표 칼럼 표시 설정", expanded=False):
+        all_cols = list(view.columns)
+        selected_cols = st.multiselect("표에 표시할 칼럼", options=all_cols, default=all_cols, key="overall_table_cols")
+    st.dataframe(view[selected_cols], use_container_width=True, height=520)
 
 
 # -------------------------
-# Tab: Per-user (composition % + deep breakdown)
+# Tab: Per-user
 # -------------------------
 with tab_user:
     users = sorted(df_all["user"].unique())
@@ -1137,11 +1127,11 @@ with tab_user:
 
     udf = df_all[df_all["user"] == user_sel].sort_values("stage_lv").copy()
 
-    c1, c2, c3 = st.columns([1, 1, 2])
+    c1, c2, c3, c4 = st.columns([1, 1, 1, 2])
     with c1:
-        split_options_u = st.checkbox("옵션 분리해서 보기(8개)", value=False, key="user_split_options")
+        view_mode_u = st.selectbox("보기", options=["비중(%)", "전투력(절대값)"], index=0, key="user_view_mode")
     with c2:
-        show_points = st.checkbox("포인트 표시(참고)", value=False, key="user_points")
+        split_options_u = st.checkbox("옵션 분리(8개)", value=False, key="user_split_options")
     with c3:
         stage_focus = st.selectbox(
             "상세 확인할 스테이지(선택)",
@@ -1149,42 +1139,61 @@ with tab_user:
             index=len(udf) - 1 if len(udf) > 0 else 0,
             key="user_stage_focus",
         )
+    with c4:
+        st.caption("유저별 그래프는 한 그래프에서 컨텐츠별 전투력/비중을 확인합니다.")
 
-    # 유저별 composition %
-    long_u = build_composition_long_df(udf[[
+    # user plot
+    stage_u = udf[[
         "stage_lv",
+        "total_power",
         "passive_power", "agency_power", "character_power",
-        "gear_base_power", "rune_base_power", "slotLv_power",
+        "gear_base_power", "slotLv_power", "rune_base_power",
         "gear_option_power", "rune_option_power",
-    ]].copy(), split_options=split_options_u)
+    ]].copy()
 
-    fig2 = px.area(
-        long_u,
-        x="stage_lv",
-        y="power",
-        color="component_label",
-        groupnorm="percent",
-        title=f"{user_sel}: 스테이지별 컨텐츠 전투력 비중(%)",
-    )
-    fig2.update_layout(yaxis_title="비중(%)")
-    st.plotly_chart(fig2, use_container_width=True)
+    if view_mode_u == "전투력(절대값)":
+        long_u = build_long_for_plot(stage_u, split_options=split_options_u, include_total=True, mode="abs")
+        order = _order_components_by_last_value(long_u, "label", "stage_lv", "value")
+        fig2 = px.line(
+            long_u,
+            x="stage_lv",
+            y="value",
+            color="label",
+            title=f"{user_sel}: 스테이지별 전투력 (전체 + 컨텐츠별)",
+            category_orders={"label": order} if order else None,
+        )
+        fig2.update_layout(yaxis_title="전투력")
+        st.plotly_chart(fig2, use_container_width=True)
+    else:
+        long_u = build_long_for_plot(stage_u, split_options=split_options_u, include_total=False, mode="pct")
+        order = _order_components_by_last_value(long_u, "label", "stage_lv", "value")
+        fig2 = px.area(
+            long_u,
+            x="stage_lv",
+            y="value",
+            color="label",
+            groupnorm="percent",
+            title=f"{user_sel}: 스테이지별 컨텐츠 전투력 비중(%)",
+            category_orders={"label": order} if order else None,
+        )
+        fig2.update_layout(yaxis_title="비중(%)")
+        st.plotly_chart(fig2, use_container_width=True)
 
     st.divider()
-
     st.subheader("선택 스테이지 상세 분해(검증용) — 패시브 제외 나머지 컨텐츠")
+
     snap = udf[udf["stage_lv"] == int(stage_focus)].iloc[0]
 
-    # 상단 요약(검증용)
+    # Inline metrics
     s1, s2, s3, s4 = st.columns(4)
     s1.metric("total_power(로그)", f"{snap['total_power']:.0f}")
     s2.metric("passive_power(잔여)", f"{snap['passive_power']:.0f}")
-    s3.metric("calc_sum_power(비패시브합)", f"{snap['calc_sum_power']:.0f}")
+    s3.metric("non_passive_sum", f"{snap['non_passive_sum']:.0f}")
     s4.metric("agency_lv", str(int(snap["agency_lv"])))
 
     s5, s6, s7, s8 = st.columns(4)
     s5.metric("agency_power", f"{snap['agency_power']:.0f}")
     s6.metric("character_power", f"{snap['character_power']:.0f}")
-    # split 옵션 여부와 무관하게 "실제 계산"은 항상 분리값을 보여줌
     s7.metric("gear_base_power", f"{snap['gear_base_power']:.0f}")
     s8.metric("slotLv_power", f"{snap['slotLv_power']:.0f}")
 
@@ -1221,11 +1230,18 @@ with tab_user:
 
 
 # -------------------------
-# Tab: Stage average (keep)
+# Tab: Stage average
 # -------------------------
 with tab_avg:
+    # 옵션은 합쳐서 보여주기:
+    #   gear_power = gear_base + gear_option
+    #   rune_power = rune_base + rune_option
+    df_tmp = df_all.copy()
+    df_tmp["gear_power"] = df_tmp["gear_base_power"].astype(float) + df_tmp["gear_option_power"].astype(float)
+    df_tmp["rune_power"] = df_tmp["rune_base_power"].astype(float) + df_tmp["rune_option_power"].astype(float)
+
     agg = (
-        df_all
+        df_tmp
         .groupby("stage_lv", as_index=False)
         .agg(
             n_users=("user", "nunique"),
@@ -1233,17 +1249,20 @@ with tab_avg:
             avg_passive_power=("passive_power", "mean"),
             avg_agency_power=("agency_power", "mean"),
             avg_character_power=("character_power", "mean"),
-            avg_gear_base_power=("gear_base_power", "mean"),
+            avg_gear_power=("gear_power", "mean"),
+            avg_rune_power=("rune_power", "mean"),
             avg_slotLv_power=("slotLv_power", "mean"),
-            avg_rune_base_power=("rune_base_power", "mean"),
-            avg_gear_option_power=("gear_option_power", "mean"),
-            avg_rune_option_power=("rune_option_power", "mean"),
-            avg_calc_sum_power=("calc_sum_power", "mean"),
             top_gear_grade=("equips_grades", _mode_from_list_series),
             top_rune_grade=("runes_grades", _mode_from_list_series),
         )
         .sort_values("stage_lv")
     )
+
+    # 반올림(정수) — 표에서만
+    round_cols = [c for c in agg.columns if c.startswith("avg_")]
+    agg_disp = agg.copy()
+    for c in round_cols:
+        agg_disp[c] = agg_disp[c].round(0).astype(int)
 
     c1, c2 = st.columns([1, 3])
     with c1:
@@ -1254,30 +1273,27 @@ with tab_avg:
                 "avg_passive_power",
                 "avg_agency_power",
                 "avg_character_power",
-                "avg_gear_base_power",
+                "avg_gear_power",
+                "avg_rune_power",
                 "avg_slotLv_power",
-                "avg_rune_base_power",
-                "avg_gear_option_power",
-                "avg_rune_option_power",
-                "avg_calc_sum_power",
             ],
             index=0,
             key="avg_metric",
         )
     with c2:
         fig3 = px.line(
-            agg,
+            agg_disp,
             x="stage_lv",
             y=metric_a,
-            title=f"Stage vs {metric_a}",
+            title=f"Stage vs {metric_a} (반올림)",
         )
         st.plotly_chart(fig3, use_container_width=True)
 
-    st.dataframe(agg, use_container_width=True, height=520)
+    st.dataframe(agg_disp, use_container_width=True, height=520)
 
 
 # -------------------------
-# Tab: Validation (keep)
+# Tab: Validation
 # -------------------------
 with tab_validate:
     st.subheader("데이터 오류 검증")
@@ -1292,6 +1308,7 @@ with tab_validate:
         show_cols = [
             "user",
             "game_end_rows", "first_clear_rows", "parsed_game_state_fail", "stage_clear_rows_emitted",
+            "passive_clamped_rows",
             "unknown_item_ids_in_equips", "unknown_item_ids_in_runes", "missing_slotType_mapping",
         ]
         show_cols = [c for c in show_cols if c in vdf.columns]
