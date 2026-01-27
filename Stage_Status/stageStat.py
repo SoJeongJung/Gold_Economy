@@ -1,29 +1,13 @@
 # stageStat.py
 # Streamlit app: Stage clear combat power + power contributions
 #
-# 이번 수정(요청 반영):
-# 1) passive_power / character_power 음수 방지
-#    - characterAtk/Hp는 입력에서 0 이상(기존) + 계산 결과도 음수 불가
-#    - passive_power = max(0, total_power - non_passive_sum) 로 클램프
-#      (계산이 total을 초과하는 경우 passive는 0으로 고정)
-#
-# 2) 전체(그래프) 탭:
-#    - "전투력(절대값)" ↔ "비중(%)" 토글 제공
-#    - 전투력(절대값) 모드: 이전처럼 "토탈 평균 전투력 + 컨텐츠별 전투력"을 한 그래프(멀티라인)로 표시
-#    - 비중(%) 모드: 누적 area(%)로 표시
-#    - 옵션 분리 보기 유지(6개 ↔ 8개)
-#      * 기본(옵션 합침): 장비옵션은 장비, 룬옵션은 룬에 합쳐서 6개 컨텐츠로 표시
-#      * 옵션 분리: (장비 옵션)/(룬 옵션) 별도로 8개 컨텐츠 표시
-#
-# 3) 스테이지 평균 탭:
-#    - 장비 옵션은 장비 파워에, 룬 옵션은 룬 파워에 "합쳐서" 표시
-#    - 표의 소수점은 반올림(정수) 처리
-#    - 그래프는 기존처럼 선택 지표 1개 라인
-#
-# 룩업 CSV
-# - Agency 룩업 CSV 1: agencyLv, agencyAtk, agencyHp
-# - Item 룩업 CSV 2: id,name,slotType,atkBase,atkInc,hpBase,hpInc,optionAtk,optionHp,optionAtkBase,optionHpBase,gradeType
-#   * optionAtk/optionHp: 5, "5%", 0.05 모두 허용(자동 ratio 변환)
+# 수정 반영:
+# - item lookup self option 컬럼명: optionAtkself/optionHpself 지원(+ optionAtkBase/optionHpBase 호환)
+# - equips/runes는 game_end의 game_state.equips / game_state.runes에서만 추출(고정)
+# - agencyLv는 agency_lvup 이벤트 + row의 agency_lv 컬럼 fallback
+# - 옵션 계산에 사용하는 passive ATK/HP는 10스테이지 구간마다 증가(80스테이지에서 max)
+# - 전체/스테이지평균에도 gear/rune self 옵션 포함
+# - 상세 분해표에서 base_atk/base_hp/with_slot_atk/with_slot_hp를 함께 표시하여 검증 용이화
 #
 # 실행:
 #   python3 -m streamlit run stageStat.py
@@ -88,16 +72,19 @@ def _safe_json_loads(s: Any) -> Any:
     if txt == "":
         return None
 
+    # json
     try:
         return json.loads(txt)
     except Exception:
         pass
 
+    # python literal
     try:
         return ast.literal_eval(txt)
     except Exception:
         pass
 
+    # weak fix (single quotes)
     try:
         txt2 = txt.replace("'", '"')
         return json.loads(txt2)
@@ -116,13 +103,12 @@ def _get_col(df: pd.DataFrame, *candidates: str) -> Optional[str]:
 
 def _to_ratio_percent(x) -> float:
     """
-    퍼센트 입력을 안전하게 '비율(0~1)'로 변환.
+    퍼센트 입력을 'ratio(0~1)'로 변환.
     허용:
       - "5%"  -> 0.05
-      - "5"   -> 0.05   (퍼센트로 간주)
+      - "5"   -> 0.05
       - 5     -> 0.05
-      - 0.05  -> 0.05   (이미 비율이면 그대로)
-      - ""/NaN -> 0.0
+      - 0.05  -> 0.05
     """
     if x is None:
         return 0.0
@@ -168,9 +154,6 @@ def _mode_from_list_series(series: pd.Series) -> str:
 
 
 def _order_components_by_last_value(long_df: pd.DataFrame, label_col: str, x_col: str, y_col: str) -> List[str]:
-    """
-    legend(카테고리) 순서를 마지막 x 지점의 y 값 큰 순으로 정렬.
-    """
     if long_df.empty:
         return []
     last_x = long_df[x_col].max()
@@ -191,10 +174,10 @@ class ItemRow:
     atkInc: float
     hpBase: float
     hpInc: float
-    optionAtk: float        # ratio(0~1)
-    optionHp: float         # ratio(0~1)
-    optionAtkBase: float    # ratio(0~1), self only (equip)
-    optionHpBase: float     # ratio(0~1), self only (equip)
+    optionAtk: float          # ratio
+    optionHp: float           # ratio
+    optionAtkSelf: float      # ratio (self-only, equip or rune)
+    optionHpSelf: float       # ratio (self-only, equip or rune)
     gradeType: str
 
 
@@ -229,12 +212,29 @@ def load_item_lookup(item_file) -> Dict[str, ItemRow]:
         else:
             df[c] = pd.to_numeric(df[cc], errors="coerce").fillna(0)
 
-    for c in ["optionAtk", "optionHp", "optionAtkBase", "optionHpBase"]:
+    # optionAtk / optionHp
+    for c in ["optionAtk", "optionHp"]:
         cc = _get_col(df, c)
         if cc is None:
             df[c] = 0.0
         else:
             df[c] = df[cc].apply(_to_ratio_percent)
+
+    # self options:
+    # - new: optionAtkself / optionHpself
+    # - old compatibility: optionAtkBase / optionHpBase
+    atk_self_col = _get_col(df, "optionAtkself", "option_atkself", "optionAtkSelf", "optionAtkBase", "option_atkbase")
+    hp_self_col = _get_col(df, "optionHpself", "option_hpself", "optionHpSelf", "optionHpBase", "option_hpbase")
+
+    if atk_self_col is None:
+        df["optionAtkSelf"] = 0.0
+    else:
+        df["optionAtkSelf"] = df[atk_self_col].apply(_to_ratio_percent)
+
+    if hp_self_col is None:
+        df["optionHpSelf"] = 0.0
+    else:
+        df["optionHpSelf"] = df[hp_self_col].apply(_to_ratio_percent)
 
     grade_col = _get_col(df, "gradeType", "gradetype", "grade_type")
     if grade_col is None:
@@ -257,8 +257,8 @@ def load_item_lookup(item_file) -> Dict[str, ItemRow]:
             hpInc=float(r["hpInc"]),
             optionAtk=float(r["optionAtk"]),
             optionHp=float(r["optionHp"]),
-            optionAtkBase=float(r["optionAtkBase"]),
-            optionHpBase=float(r["optionHpBase"]),
+            optionAtkSelf=float(r["optionAtkSelf"]),
+            optionHpSelf=float(r["optionHpSelf"]),
             gradeType=str(r["gradeType"]),
         )
     return out
@@ -342,7 +342,6 @@ def parse_user_csv(user_file) -> pd.DataFrame:
     df["agency_lv"] = df["agency_lv"].apply(_to_int)
 
     df["_gs"] = df["game_state"].apply(_safe_json_loads)
-
     return df.sort_values("time").reset_index(drop=True)
 
 
@@ -351,6 +350,42 @@ def slot_levels_to_columns(slot_lv_by_type_id: Dict[int, int]) -> Dict[str, int]
     for i in range(1, 7):
         out[f"slot_lv_{i}"] = int(slot_lv_by_type_id.get(i, 0))
     return out
+
+
+# =========================
+# Passive ATK/HP schedule for option calc
+# =========================
+def assumed_passive_atk_hp_by_stage(
+    stage_lv: int,
+    start_atk: float = 75.0,
+    start_hp: float = 300.0,
+    max_atk: float = 900.0,
+    max_hp: float = 3600.0,
+    cap_stage: int = 80,
+    step_stage: int = 10,
+) -> Tuple[float, float]:
+    """
+    옵션 계산에만 쓰는 '가정 패시브 ATK/HP'
+    - 10스테이지 구간(step_stage)마다 점차 증가(계단식)
+    - cap_stage(80)에서 max에 도달
+    """
+    if stage_lv <= 0:
+        return start_atk, start_hp
+    cap = max(1, int(cap_stage))
+    step = max(1, int(step_stage))
+
+    # 1~80 => bucket 0~7
+    bucket = min((int(stage_lv) - 1) // step, (cap - 1) // step)
+    max_bucket = (cap - 1) // step
+    if max_bucket <= 0:
+        return start_atk, start_hp
+
+    t = bucket / float(max_bucket)
+    atk = start_atk + (max_atk - start_atk) * t
+    hp = start_hp + (max_hp - start_hp) * t
+
+    # 옵션 베이스는 소수점 싫다 했으니(이전 대화), 여기서 내림 처리
+    return float(np.floor(atk)), float(np.floor(hp))
 
 
 # =========================
@@ -374,6 +409,7 @@ def calc_item_power(item: ItemRow, slot_lv: int, is_equip: bool) -> Tuple[float,
 
 
 def sum_equip_rune_components(
+    stage_lv: int,
     equip_ids: List[str],
     rune_ids: List[str],
     slot_lv_by_type_id: Dict[int, int],
@@ -383,14 +419,11 @@ def sum_equip_rune_components(
     agencyHp: float,
     characterAtk: float,
     characterHp: float,
-    assumed_passiveAtk_for_option: float,
-    assumed_passiveHp_for_option: float,
 ) -> Dict[str, Any]:
     """
     반환:
       - gear_base_power, slotLv_power, rune_base_power
-      - gear_option_power(= gear_total + gear_self), rune_option_power(= rune_total)
-      - option_base_atk/hp, gear/rune atk/hp sums
+      - gear_option_power(= gear_total + gear_self), rune_option_power(= rune_total + rune_self)
       - equips/runes names + grades
     """
     gear_base_power = 0.0
@@ -413,9 +446,11 @@ def sum_equip_rune_components(
     rune_optAtk_pct_sum = 0.0
     rune_optHp_pct_sum = 0.0
 
-    # self 옵션(gear only)
-    option_gear_self_atk = 0.0
-    option_gear_self_hp = 0.0
+    # self 옵션 (gear + rune 모두 가능)
+    gear_self_atk = 0.0
+    gear_self_hp = 0.0
+    rune_self_atk = 0.0
+    rune_self_hp = 0.0
 
     # ---- equips
     for eid in equip_ids:
@@ -431,7 +466,7 @@ def sum_equip_rune_components(
         type_id = slotType_to_type_id.get(it.slotType)
         lv = slot_lv_by_type_id.get(int(type_id), 0) if type_id is not None else 0
 
-        # gear_base: slot_lv=0 기준
+        # base: slot_lv=0 기준(inc=0)
         base_atk, base_hp, base_p = calc_item_power(it, 0, is_equip=True)
         # with slot
         atk, hp, p = calc_item_power(it, lv, is_equip=True)
@@ -446,11 +481,11 @@ def sum_equip_rune_components(
         gear_optAtk_pct_sum += it.optionAtk
         gear_optHp_pct_sum += it.optionHp
 
-        # self 옵션 (장비 자기 자신 기준)
-        if it.optionAtkBase:
-            option_gear_self_atk += atk * it.optionAtkBase
-        if it.optionHpBase:
-            option_gear_self_hp += hp * it.optionHpBase
+        # self 옵션(장비 자신의 atk/hp 기준)
+        if it.optionAtkSelf:
+            gear_self_atk += atk * it.optionAtkSelf
+        if it.optionHpSelf:
+            gear_self_hp += hp * it.optionHpSelf
 
     # ---- runes
     for rid in rune_ids:
@@ -473,16 +508,25 @@ def sum_equip_rune_components(
         rune_optAtk_pct_sum += it.optionAtk
         rune_optHp_pct_sum += it.optionHp
 
-    # 옵션 base (ATK/HP) — passive는 "가정값"으로 옵션에만 사용
+        # rune self 옵션(룬 자신의 atk/hp 기준)도 지원
+        if it.optionAtkSelf:
+            rune_self_atk += atk * it.optionAtkSelf
+        if it.optionHpSelf:
+            rune_self_hp += hp * it.optionHpSelf
+
+    # 옵션 계산용 패시브(스테이지별 계단 상승)
+    assumed_pAtk, assumed_pHp = assumed_passive_atk_hp_by_stage(stage_lv)
+
+    # 옵션 base (ATK/HP) — passive는 '가정값'으로 옵션에만 사용
     option_base_atk = (
-        float(assumed_passiveAtk_for_option)
+        float(assumed_pAtk)
         + float(agencyAtk)
         + float(characterAtk)
         + float(gear_atk_sum)
         + float(rune_atk_sum)
     )
     option_base_hp = (
-        float(assumed_passiveHp_for_option)
+        float(assumed_pHp)
         + float(agencyHp)
         + float(characterHp)
         + float(gear_hp_sum)
@@ -490,20 +534,22 @@ def sum_equip_rune_components(
     )
 
     # gear option(total)
-    option_gear_total_atk = option_base_atk * gear_optAtk_pct_sum
-    option_gear_total_hp = option_base_hp * gear_optHp_pct_sum
+    gear_total_atk = option_base_atk * gear_optAtk_pct_sum
+    gear_total_hp = option_base_hp * gear_optHp_pct_sum
 
     # rune option(total)
-    option_rune_total_atk = option_base_atk * rune_optAtk_pct_sum
-    option_rune_total_hp = option_base_hp * rune_optHp_pct_sum
+    rune_total_atk = option_base_atk * rune_optAtk_pct_sum
+    rune_total_hp = option_base_hp * rune_optHp_pct_sum
 
     # power 환산
-    option_gear_total_power = option_gear_total_atk * 4.0 + option_gear_total_hp
-    option_gear_self_power = (option_gear_self_atk * 4.0) + option_gear_self_hp
-    option_rune_total_power = option_rune_total_atk * 4.0 + option_rune_total_hp
+    gear_total_power = gear_total_atk * 4.0 + gear_total_hp
+    gear_self_power = (gear_self_atk * 4.0) + gear_self_hp
 
-    gear_option_power = option_gear_total_power + option_gear_self_power
-    rune_option_power = option_rune_total_power
+    rune_total_power = rune_total_atk * 4.0 + rune_total_hp
+    rune_self_power = (rune_self_atk * 4.0) + rune_self_hp
+
+    gear_option_power = gear_total_power + gear_self_power
+    rune_option_power = rune_total_power + rune_self_power
 
     return {
         "gear_base_power": gear_base_power,
@@ -513,9 +559,10 @@ def sum_equip_rune_components(
         "gear_option_power": gear_option_power,
         "rune_option_power": rune_option_power,
 
-        "option_gear_total_power": option_gear_total_power,
-        "option_gear_self_power": option_gear_self_power,
-        "option_rune_total_power": option_rune_total_power,
+        "option_gear_total_power": gear_total_power,
+        "option_gear_self_power": gear_self_power,
+        "option_rune_total_power": rune_total_power,
+        "option_rune_self_power": rune_self_power,
 
         "gear_atk_sum": gear_atk_sum,
         "gear_hp_sum": gear_hp_sum,
@@ -534,6 +581,9 @@ def sum_equip_rune_components(
         "gear_optHp_pct_sum": gear_optHp_pct_sum,
         "rune_optAtk_pct_sum": rune_optAtk_pct_sum,
         "rune_optHp_pct_sum": rune_optHp_pct_sum,
+
+        "assumed_passiveAtk_for_option": assumed_pAtk,
+        "assumed_passiveHp_for_option": assumed_pHp,
     }
 
 
@@ -548,8 +598,6 @@ def build_stage_rows_for_user(
     item_map: Dict[str, ItemRow],
     characterAtk: float,
     characterHp: float,
-    assumed_passiveAtk_for_option: float,
-    assumed_passiveHp_for_option: float,
 ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     slot_lv_by_type_id: Dict[int, int] = {}
     agency_lv_current: int = 0
@@ -565,21 +613,29 @@ def build_stage_rows_for_user(
         "parsed_game_state_fail": 0,
         "stage_clear_rows_emitted": 0,
         "passive_clamped_rows": 0,
+        "agency_fallback_used_rows": 0,
     }
 
     for _, r in df.iterrows():
         ev = str(r["event_name"])
 
+        # slot lv updates
         if ev == "inventory_slot_lvup":
             stype = int(r.get("slot_type", 0) or 0)
             slv = int(r.get("slot_lv", 0) or 0)
             if stype > 0:
                 slot_lv_by_type_id[stype] = slv
 
+        # agency updates from event
         if ev == "agency_lvup":
             alv = int(r.get("agency_lv", 0) or 0)
             if alv > 0:
                 agency_lv_current = alv
+
+        # agency fallback from column (모든 row에서 읽어두기)
+        col_ag = int(r.get("agency_lv", 0) or 0)
+        if col_ag > 0 and col_ag > agency_lv_current:
+            agency_lv_current = col_ag
 
         if ev == "game_end":
             validation["game_end_rows"] += 1
@@ -595,6 +651,7 @@ def build_stage_rows_for_user(
                 continue
             validation["first_clear_rows"] += 1
 
+            # ✅ equips/runes는 반드시 game_state에서!
             equips = gs.get("equips", []) or []
             runes = gs.get("runes", []) or []
             equips = [str(x) for x in equips]
@@ -629,6 +686,7 @@ def build_stage_rows_for_user(
             character_power = cAtk * 4.0 + cHp
 
             comps = sum_equip_rune_components(
+                stage_lv=stage_lv,
                 equip_ids=equips,
                 rune_ids=runes,
                 slot_lv_by_type_id=slot_lv_by_type_id,
@@ -638,8 +696,6 @@ def build_stage_rows_for_user(
                 agencyHp=agencyHp,
                 characterAtk=cAtk,
                 characterHp=cHp,
-                assumed_passiveAtk_for_option=assumed_passiveAtk_for_option,
-                assumed_passiveHp_for_option=assumed_passiveHp_for_option,
             )
 
             non_passive_sum = (
@@ -660,7 +716,7 @@ def build_stage_rows_for_user(
                 passive_power = 0.0
                 validation["passive_clamped_rows"] += 1
 
-            calc_sum_power = non_passive_sum + passive_power  # passive 포함(클램프 반영)
+            calc_sum_power = non_passive_sum + passive_power
 
             row = {
                 "user": user_label,
@@ -691,6 +747,7 @@ def build_stage_rows_for_user(
                 "option_gear_total_power": comps["option_gear_total_power"],
                 "option_gear_self_power": comps["option_gear_self_power"],
                 "option_rune_total_power": comps["option_rune_total_power"],
+                "option_rune_self_power": comps["option_rune_self_power"],
 
                 "gear_atk_sum": comps["gear_atk_sum"],
                 "gear_hp_sum": comps["gear_hp_sum"],
@@ -704,6 +761,9 @@ def build_stage_rows_for_user(
                 "rune_optAtk_pct_sum": comps["rune_optAtk_pct_sum"],
                 "rune_optHp_pct_sum": comps["rune_optHp_pct_sum"],
 
+                "assumed_passiveAtk_for_option": comps["assumed_passiveAtk_for_option"],
+                "assumed_passiveHp_for_option": comps["assumed_passiveHp_for_option"],
+
                 "equips_ids": equips,
                 "runes_ids": runes,
                 "equips_names": comps["equips_names"],
@@ -715,7 +775,7 @@ def build_stage_rows_for_user(
                 "non_passive_sum": non_passive_sum,
                 "passive_power": passive_power,
                 "calc_sum_power": calc_sum_power,
-                "passive_raw": passive_raw,  # 디버그용(표에서 숨길 수 있음)
+                "passive_raw": passive_raw,  # 디버그용
             }
             row.update(slot_levels_to_columns(slot_lv_by_type_id))
             rows.append(row)
@@ -760,23 +820,25 @@ def build_breakdown_tables_for_snapshot(
                 "slotType": "",
                 "slot_type_id": None,
                 "slot_lv": None,
-                "atk": 0.0,
-                "hp": 0.0,
-                "power(with slot)": 0.0,
+                "base_atk(slot0)": 0.0,
+                "base_hp(slot0)": 0.0,
+                "with_slot_atk": 0.0,
+                "with_slot_hp": 0.0,
                 "base_power(slot_lv=0)": 0.0,
+                "power(with slot)": 0.0,
                 "slotLv_power": 0.0,
                 "optionAtk(ratio)": 0.0,
                 "optionHp(ratio)": 0.0,
-                "optionAtkBase(ratio)": 0.0,
-                "optionHpBase(ratio)": 0.0,
+                "optionAtkself(ratio)": 0.0,
+                "optionHpself(ratio)": 0.0,
             })
             continue
 
         type_id = slotType_to_type_id.get(it.slotType)
         lv = slot_lv_by_type_id.get(int(type_id), 0) if type_id is not None else 0
 
+        base_atk, base_hp, base_p = calc_item_power(it, 0, is_equip=True)
         atk, hp, p = calc_item_power(it, lv, is_equip=True)
-        _, _, base_p = calc_item_power(it, 0, is_equip=True)
 
         equip_rows.append({
             "name": it.name,
@@ -785,15 +847,20 @@ def build_breakdown_tables_for_snapshot(
             "slotType": it.slotType,
             "slot_type_id": type_id,
             "slot_lv": lv,
-            "atk": atk,
-            "hp": hp,
-            "power(with slot)": p,
+
+            "base_atk(slot0)": base_atk,
+            "base_hp(slot0)": base_hp,
+            "with_slot_atk": atk,
+            "with_slot_hp": hp,
+
             "base_power(slot_lv=0)": base_p,
+            "power(with slot)": p,
             "slotLv_power": p - base_p,
+
             "optionAtk(ratio)": it.optionAtk,
             "optionHp(ratio)": it.optionHp,
-            "optionAtkBase(ratio)": it.optionAtkBase,
-            "optionHpBase(ratio)": it.optionHpBase,
+            "optionAtkself(ratio)": it.optionAtkSelf,
+            "optionHpself(ratio)": it.optionHpSelf,
         })
 
     equip_df = pd.DataFrame(equip_rows)
@@ -814,6 +881,8 @@ def build_breakdown_tables_for_snapshot(
                 "base_power": 0.0,
                 "optionAtk(ratio)": 0.0,
                 "optionHp(ratio)": 0.0,
+                "optionAtkself(ratio)": 0.0,
+                "optionHpself(ratio)": 0.0,
             })
             continue
 
@@ -828,6 +897,8 @@ def build_breakdown_tables_for_snapshot(
             "base_power": p,
             "optionAtk(ratio)": it.optionAtk,
             "optionHp(ratio)": it.optionHp,
+            "optionAtkself(ratio)": it.optionAtkSelf,
+            "optionHpself(ratio)": it.optionHpSelf,
         })
 
     rune_df = pd.DataFrame(rune_rows)
