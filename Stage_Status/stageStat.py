@@ -722,7 +722,7 @@ with st.sidebar:
 
     agency_atk_ratio = st.number_input(
         "Agency ATK 환산 비율",
-        min_value=0.0, max_value=10.0, value=0.250,
+        min_value=0.0, max_value=10.0, value=0.125,
         step=0.001, format="%.3f", key="agency_atk_ratio"
     )
     agency_hp_ratio = st.number_input(
