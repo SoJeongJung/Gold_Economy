@@ -1,12 +1,21 @@
 # stageStat.py
-# Streamlit app: Stage clear combat power + power contributions (passive/agency/character/gear/slotLv/rune/options)
+# Streamlit app: Stage clear combat power + power contributions (equip/rune/agency/equip-level)
 #
-# 이번 수정 반영(중요):
-# - 옵션 계산 시 passive ATK/HP는 "고정 가정값" 사용 (기본: 75 / 300)
-# - gear_power = gear_base_power + optionAtk_gear*4 + optionHp_gear  (slotLv_power는 별도)
-# - rune_power = rune_base_power + optionAtk_rune*4 + optionHp_rune
-# - passive_power(=그 외 옵션 전투력) = final_power - (agency + character + gear_base + slotLv + rune_base + gear_option + rune_option)
-# - 전체/유저별/스테이지평균 그래프: 한 그래프에서 구성요소를 토글(범례 클릭)
+# 유지(기존 UI/구조 최대한 유지):
+# - equips/runes: ID가 아니라 "name" 중심으로 표시 (id는 검증용 유지)
+# - gap_total_minus_calc / gap_label 유지
+# - 표 칼럼 표시 설정(전체/유저별) 유지
+# - 그래프/탭 구성 유지
+#
+# 이번 반영:
+# 1) optionAtk / optionHp / optionAtkBase / optionHpBase 퍼센트 파싱 개선 (0으로 떨어지는 문제 해결)
+#    - "5%" -> 0.05
+#    - "5"  -> 0.05
+#    - 0.05 -> 0.05
+# 2) item lookup CSV에 gradeType 컬럼 추가 지원
+# 3) 스테이지별 최빈 grade 도출:
+#    - top_gear_grade: 해당 stage의 모든 유저 스냅샷에서 equips의 gradeType 최빈
+#    - top_rune_grade: 해당 stage의 모든 유저 스냅샷에서 runes의 gradeType 최빈
 #
 # 실행:
 #   python3 -m streamlit run stageStat.py
@@ -15,6 +24,7 @@ import json
 import ast
 from dataclasses import dataclass
 from typing import Dict, Any, List, Optional, Tuple
+from collections import Counter
 
 import numpy as np
 import pandas as pd
@@ -61,13 +71,6 @@ def _to_int(x) -> int:
         return 0
 
 
-def _floor(x: float) -> int:
-    try:
-        return int(np.floor(float(x)))
-    except Exception:
-        return 0
-
-
 def _safe_json_loads(s: Any) -> Any:
     if s is None or (isinstance(s, float) and np.isnan(s)):
         return None
@@ -103,30 +106,58 @@ def _get_col(df: pd.DataFrame, *candidates: str) -> Optional[str]:
     return None
 
 
-def power_from_atk_hp(atk: float, hp: float, atk_weight: float = 4.0, hp_weight: float = 1.0) -> float:
-    return atk * atk_weight + hp * hp_weight
+def _to_ratio_percent(x) -> float:
+    """
+    퍼센트 입력을 안전하게 '비율(0~1)'로 변환.
+    허용:
+      - "5%"  -> 0.05
+      - "5"   -> 0.05   (퍼센트로 간주)
+      - 5     -> 0.05
+      - 0.05  -> 0.05   (이미 비율이면 그대로)
+      - ""/NaN -> 0.0
+    """
+    if x is None:
+        return 0.0
+    if isinstance(x, float) and np.isnan(x):
+        return 0.0
+
+    s = str(x).strip()
+    if s == "":
+        return 0.0
+
+    has_pct = "%" in s
+    s2 = s.replace("%", "").replace(",", "").strip()
+
+    try:
+        v = float(s2)
+    except Exception:
+        return 0.0
+
+    if has_pct:
+        return v / 100.0
+
+    # 퍼센트 표기가 없을 때:
+    # 0~1이면 이미 비율로 판단, 1보다 크면 퍼센트(5 -> 5%)
+    if 0.0 <= v <= 1.0:
+        return v
+    return v / 100.0
 
 
-def names_join(xs: Any) -> str:
-    if isinstance(xs, list):
-        return ", ".join([str(x) for x in xs])
-    if xs is None or (isinstance(xs, float) and np.isnan(xs)):
+def _mode_from_list_series(series: pd.Series) -> str:
+    """
+    series: 각 row가 list를 들고있는 Series (예: equips_grades)
+    모든 리스트를 flatten 후 최빈값 반환. 없으면 "".
+    """
+    vals: List[str] = []
+    for x in series:
+        if isinstance(x, list):
+            vals.extend([str(v) for v in x if str(v).strip() != ""])
+    if not vals:
         return ""
-    return str(xs)
+    c = Counter(vals)
+    return c.most_common(1)[0][0]
 
 
-def _gap_label(g: float) -> str:
-    gi = int(_floor(g))
-    if gi == 0:
-        return "정확"
-    if gi > 0:
-        return f"부족 {gi}"
-    return f"초과 {abs(gi)}"
-
-
-# =========================
-# Data models
-# =========================
 @dataclass
 class ItemRow:
     id: str
@@ -136,15 +167,14 @@ class ItemRow:
     atkInc: float
     hpBase: float
     hpInc: float
-    optionAtk: int          # % (예: 5 -> 5%)
-    optionHp: int
-    optionAtkself: int      # % (예: 20 -> 20%)  (장비/룬 개별 base에만 적용)
-    optionHpself: int
+    # ratio(0~1)
+    optionAtk: float
+    optionHp: float
+    optionAtkBase: float
+    optionHpBase: float
+    gradeType: str
 
 
-# =========================
-# Loaders
-# =========================
 def load_item_lookup(item_file) -> Dict[str, ItemRow]:
     df = pd.read_csv(item_file)
     df = _clean_cols(df)
@@ -153,9 +183,8 @@ def load_item_lookup(item_file) -> Dict[str, ItemRow]:
     name_col = _get_col(df, "name")
     slot_col = _get_col(df, "slotType", "slottype", "slot_type")
     if id_col is None or name_col is None or slot_col is None:
-        raise ValueError("Item lookup CSV must include: id, name, slotType")
+        raise ValueError("Item lookup CSV must include: id, name, slotType, atkBase, atkInc, hpBase, hpInc")
 
-    # base/inc
     for c in ["atkBase", "atkInc", "hpBase", "hpInc"]:
         cc = _get_col(df, c)
         if cc is None:
@@ -163,29 +192,20 @@ def load_item_lookup(item_file) -> Dict[str, ItemRow]:
         else:
             df[c] = pd.to_numeric(df[cc], errors="coerce").fillna(0)
 
-    # pct options
-    for c in ["optionAtk", "optionHp"]:
+    # 옵션 컬럼 (없으면 0), ratio(0~1)로 통일
+    for c in ["optionAtk", "optionHp", "optionAtkBase", "optionHpBase"]:
         cc = _get_col(df, c)
         if cc is None:
-            df[c] = 0
+            df[c] = 0.0
         else:
-            df[c] = pd.to_numeric(df[cc], errors="coerce").fillna(0).astype(int)
+            df[c] = df[cc].apply(_to_ratio_percent)
 
-    # self options (이름이 바뀌었을 수 있어서 둘 다 지원)
-    # - 새로운 스펙: optionAtkself / optionHpself
-    # - 과거 스펙: optionAtkBase / optionHpBase
-    atkself_col = _get_col(df, "optionAtkself", "optionAtkBase")
-    hpself_col = _get_col(df, "optionHpself", "optionHpBase")
-
-    if atkself_col is None:
-        df["optionAtkself"] = 0
+    # gradeType (없으면 "")
+    grade_col = _get_col(df, "gradeType", "gradetype", "grade_type")
+    if grade_col is None:
+        df["gradeType"] = ""
     else:
-        df["optionAtkself"] = pd.to_numeric(df[atkself_col], errors="coerce").fillna(0).astype(int)
-
-    if hpself_col is None:
-        df["optionHpself"] = 0
-    else:
-        df["optionHpself"] = pd.to_numeric(df[hpself_col], errors="coerce").fillna(0).astype(int)
+        df["gradeType"] = df[grade_col].fillna("").astype(str)
 
     df["id_str"] = df[id_col].astype(str)
 
@@ -200,34 +220,151 @@ def load_item_lookup(item_file) -> Dict[str, ItemRow]:
             atkInc=float(r["atkInc"]),
             hpBase=float(r["hpBase"]),
             hpInc=float(r["hpInc"]),
-            optionAtk=int(r["optionAtk"]),
-            optionHp=int(r["optionHp"]),
-            optionAtkself=int(r["optionAtkself"]),
-            optionHpself=int(r["optionHpself"]),
+            optionAtk=float(r["optionAtk"]),
+            optionHp=float(r["optionHp"]),
+            optionAtkBase=float(r["optionAtkBase"]),
+            optionHpBase=float(r["optionHpBase"]),
+            gradeType=str(r["gradeType"]),
         )
     return out
 
 
-def load_agency_lookup(agency_file) -> Dict[int, Tuple[float, float]]:
-    """
-    CSV columns: agencyLv, agencyAtk, agencyHp
-    returns {agencyLv: (agencyAtk, agencyHp)}
-    """
+def load_agency_lookup(agency_file) -> Dict[int, float]:
     df = pd.read_csv(agency_file)
     df = _clean_cols(df)
 
-    lvl_col = _get_col(df, "agencyLv", "lvl", "level", "agency_lv")
-    atk_col = _get_col(df, "agencyAtk", "atk", "agency_atk")
-    hp_col = _get_col(df, "agencyHp", "hp", "agency_hp", "agnecyHp", "agnecyhp")  # typo tolerance
-
-    if lvl_col is None or atk_col is None or hp_col is None:
-        raise ValueError("Agency lookup CSV must include columns: agencyLv, agencyAtk, agencyHp")
+    lvl_col = _get_col(df, "lvl", "level", "agency_lv", "agency_level")
+    pwr_col = _get_col(df, "agency_power", "power")
+    if lvl_col is None or pwr_col is None:
+        raise ValueError("Agency lookup CSV must include columns: lvl, agency_power")
 
     df["lvl_i"] = df[lvl_col].apply(_to_int)
-    df["atk_f"] = df[atk_col].apply(_to_float)
-    df["hp_f"] = df[hp_col].apply(_to_float)
+    df["pwr_f"] = df[pwr_col].apply(_to_float)
+    return dict(zip(df["lvl_i"], df["pwr_f"]))
 
-    return dict(zip(df["lvl_i"], list(zip(df["atk_f"], df["hp_f"]))))
+
+def calc_item_power(item: ItemRow, slot_lv: int, is_equip: bool) -> Tuple[float, float, float]:
+    """
+    Returns (atk_calc, hp_calc, power)
+    - Equip: atk = atkBase + atkInc*slot_lv, hp = hpBase + hpInc*slot_lv
+    - Rune:  atk = atkBase, hp = hpBase (Inc ignored, slot_lv ignored)
+    - power = atk*4 + hp
+    """
+    if is_equip:
+        atk = item.atkBase + item.atkInc * slot_lv
+        hp = item.hpBase + item.hpInc * slot_lv
+    else:
+        atk = item.atkBase
+        hp = item.hpBase
+    power = atk * 4.0 + hp
+    return atk, hp, power
+
+
+def sum_equip_rune_power(
+    equip_ids: List[str],
+    rune_ids: List[str],
+    slot_lv_by_type_id: Dict[int, int],
+    slotType_to_type_id: Dict[str, int],
+    item_map: Dict[str, ItemRow],
+) -> Tuple[
+    float, float, float, float,
+    float, float, float, float,
+    List[str], List[str],
+    List[str], List[str]
+]:
+    """
+    Returns:
+      equip_power, rune_power, equip_base_power, equip_level_power,
+      optionAtk_power_total, optionHp_power_total, optionAtk_power_self, optionHp_power_self,
+      equip_names, rune_names,
+      equip_grades, rune_grades
+    """
+    equip_power = 0.0
+    equip_base_power = 0.0
+    rune_power = 0.0
+
+    equip_names: List[str] = []
+    rune_names: List[str] = []
+    equip_grades: List[str] = []
+    rune_grades: List[str] = []
+
+    total_atk_pre_option = 0.0
+    total_hp_pre_option = 0.0
+
+    optionAtk_pct_sum = 0.0  # ratio(0~1) 합
+    optionHp_pct_sum = 0.0
+
+    optionAtk_power_self = 0.0
+    optionHp_power_self = 0.0
+
+    for eid in equip_ids:
+        it = item_map.get(str(eid))
+        if not it:
+            equip_names.append(f"(missing:{eid})")
+            equip_grades.append("")
+            continue
+
+        equip_names.append(it.name)
+        equip_grades.append(it.gradeType or "")
+
+        type_id = slotType_to_type_id.get(it.slotType)
+        lv = slot_lv_by_type_id.get(int(type_id), 0) if type_id is not None else 0
+
+        atk, hp, p = calc_item_power(it, lv, is_equip=True)
+        _, _, base = calc_item_power(it, 0, is_equip=True)
+
+        equip_power += p
+        equip_base_power += base
+
+        total_atk_pre_option += atk
+        total_hp_pre_option += hp
+
+        optionAtk_pct_sum += it.optionAtk
+        optionHp_pct_sum += it.optionHp
+
+        if it.optionAtkBase:
+            optionAtk_power_self += (atk * it.optionAtkBase) * 4.0
+        if it.optionHpBase:
+            optionHp_power_self += (hp * it.optionHpBase)
+
+    for rid in rune_ids:
+        it = item_map.get(str(rid))
+        if not it:
+            rune_names.append(f"(missing:{rid})")
+            rune_grades.append("")
+            continue
+
+        rune_names.append(it.name)
+        rune_grades.append(it.gradeType or "")
+
+        atk, hp, p = calc_item_power(it, 0, is_equip=False)
+        rune_power += p
+
+        total_atk_pre_option += atk
+        total_hp_pre_option += hp
+
+        optionAtk_pct_sum += it.optionAtk
+        optionHp_pct_sum += it.optionHp
+
+    equip_level_power = equip_power - equip_base_power
+
+    optionAtk_power_total = (total_atk_pre_option * optionAtk_pct_sum) * 4.0
+    optionHp_power_total = (total_hp_pre_option * optionHp_pct_sum)
+
+    return (
+        equip_power,
+        rune_power,
+        equip_base_power,
+        equip_level_power,
+        optionAtk_power_total,
+        optionHp_power_total,
+        optionAtk_power_self,
+        optionHp_power_self,
+        equip_names,
+        rune_names,
+        equip_grades,
+        rune_grades,
+    )
 
 
 def parse_user_csv(user_file) -> pd.DataFrame:
@@ -295,306 +432,13 @@ def slot_levels_to_columns(slot_lv_by_type_id: Dict[int, int]) -> Dict[str, int]
     return out
 
 
-# =========================
-# Sidebar: Inputs
-# =========================
-with st.sidebar:
-    st.header("입력")
-
-    max_stage = st.number_input("최대 스테이지", min_value=1, max_value=2000, value=240, step=10)
-
-    user_files = st.file_uploader(
-        "유저 CSV 업로드 (1개~N개)",
-        type=["csv"],
-        accept_multiple_files=True,
-    )
-
-    agency_lookup_file = st.file_uploader(
-        "룩업 CSV 1 (Agency) — 컬럼: agencyLv, agencyAtk, agencyHp",
-        type=["csv"],
-        accept_multiple_files=False,
-    )
-
-    item_lookup_file = st.file_uploader(
-        "룩업 CSV 2 (Items: Equip+Rune) — 컬럼: id,name,slotType,atkBase,atkInc,hpBase,hpInc,optionAtk,optionHp,optionAtkself(or optionAtkBase),optionHpself(or optionHpBase)",
-        type=["csv"],
-        accept_multiple_files=False,
-    )
-
-    st.divider()
-    st.subheader("Character 고정값")
-    character_atk = st.number_input("characterAtk", min_value=0, max_value=10_000, value=75, step=1)
-    character_hp = st.number_input("characterHp", min_value=0, max_value=100_000, value=300, step=10)
-
-    st.divider()
-    st.subheader("Passive 가정값(옵션 계산용)")
-    st.caption("옵션 계산 베이스에 들어가는 passive ATK/HP는 고정 가정값으로 사용합니다.")
-    passive_atk_assume = st.number_input("passiveAtk(assume)", min_value=0, max_value=100_000, value=75, step=1)
-    passive_hp_assume = st.number_input("passiveHp(assume)", min_value=0, max_value=100_000, value=300, step=10)
-
-    st.divider()
-    st.subheader("slotType 매핑")
-    st.caption("Item.slotType 문자열 → 유저 CSV의 slot_type(1~6)로 매핑 (기본: Hat/Coat/Ring/Neck/Belt/Boots)")
-    default_slotType_mapping = {
-        "Hat": 1,
-        "Coat": 2,
-        "Ring": 3,
-        "Neck": 4,
-        "Belt": 5,
-        "Boots": 6,
-    }
-    default_lines = "\n".join([f"{k}={v}" for k, v in default_slotType_mapping.items()])
-    mapping_txt = st.text_area("매핑 편집", value=default_lines, height=160)
-
-    slotType_to_type_id: Dict[str, int] = {}
-    for line in mapping_txt.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        k, v = line.split("=", 1)
-        k = k.strip()
-        try:
-            slotType_to_type_id[k] = int(v.strip())
-        except Exception:
-            continue
-    if not slotType_to_type_id:
-        slotType_to_type_id = default_slotType_mapping
-
-
-# =========================
-# Validate required uploads
-# =========================
-if not user_files:
-    st.info("왼쪽에서 유저 CSV(1개 이상)를 업로드하세요.")
-    st.stop()
-if agency_lookup_file is None:
-    st.info("왼쪽에서 Agency 룩업 CSV(agencyLv, agencyAtk, agencyHp)를 업로드하세요.")
-    st.stop()
-if item_lookup_file is None:
-    st.info("왼쪽에서 Item 룩업 CSV를 업로드하세요.")
-    st.stop()
-
-try:
-    agency_map = load_agency_lookup(agency_lookup_file)
-    item_map = load_item_lookup(item_lookup_file)
-except Exception as e:
-    st.error(f"룩업 파일 로딩 실패: {e}")
-    st.stop()
-
-
-# =========================
-# Core calc per snapshot
-# =========================
-def compute_components_for_snapshot(
-    equips: List[str],
-    runes: List[str],
-    slot_lv_by_type_id: Dict[int, int],
-    agency_lv: int,
-    final_power: float,
-) -> Dict[str, Any]:
-    # ---------- agency
-    agency_atk, agency_hp = agency_map.get(int(agency_lv), (0.0, 0.0))
-    agency_power = power_from_atk_hp(agency_atk, agency_hp)
-
-    # ---------- character (fixed)
-    character_atk_f = float(character_atk)
-    character_hp_f = float(character_hp)
-    character_power = power_from_atk_hp(character_atk_f, character_hp_f)
-
-    # ---------- gear base + slotLv (separate) + gear option%
-    gear_base_atk = 0.0
-    gear_base_hp = 0.0
-    slotLv_atk = 0.0
-    slotLv_hp = 0.0
-
-    gear_option_pct_atk_sum = 0.0
-    gear_option_pct_hp_sum = 0.0
-    gear_option_self_atk = 0.0
-    gear_option_self_hp = 0.0
-
-    equip_names: List[str] = []
-
-    for eid in equips:
-        it = item_map.get(str(eid))
-        if not it:
-            equip_names.append(f"(missing:{eid})")
-            continue
-        equip_names.append(it.name)
-
-        # gear base uses atkBase/hpBase ONLY
-        gear_base_atk += it.atkBase
-        gear_base_hp += it.hpBase
-
-        # slotLv power uses inc*slotLv (type mapping)
-        type_id = slotType_to_type_id.get(it.slotType)
-        lv = slot_lv_by_type_id.get(int(type_id), 0) if type_id is not None else 0
-        slotLv_atk += it.atkInc * lv
-        slotLv_hp += it.hpInc * lv
-
-        # pct option (gear)
-        gear_option_pct_atk_sum += (it.optionAtk / 100.0)
-        gear_option_pct_hp_sum += (it.optionHp / 100.0)
-
-        # self option is based on "this gear's own stat" (base+inc*lv)
-        equip_atk_total = it.atkBase + it.atkInc * lv
-        equip_hp_total = it.hpBase + it.hpInc * lv
-        if it.optionAtkself:
-            gear_option_self_atk += equip_atk_total * (it.optionAtkself / 100.0)
-        if it.optionHpself:
-            gear_option_self_hp += equip_hp_total * (it.optionHpself / 100.0)
-
-    gear_base_power = power_from_atk_hp(gear_base_atk, gear_base_hp)
-    slotLv_power = power_from_atk_hp(slotLv_atk, slotLv_hp)
-
-    # ---------- runes base + rune option%
-    rune_base_atk = 0.0
-    rune_base_hp = 0.0
-
-    rune_option_pct_atk_sum = 0.0
-    rune_option_pct_hp_sum = 0.0
-    rune_option_self_atk = 0.0
-    rune_option_self_hp = 0.0
-
-    rune_names: List[str] = []
-
-    for rid in runes:
-        it = item_map.get(str(rid))
-        if not it:
-            rune_names.append(f"(missing:{rid})")
-            continue
-        rune_names.append(it.name)
-
-        rune_base_atk += it.atkBase
-        rune_base_hp += it.hpBase
-
-        rune_option_pct_atk_sum += (it.optionAtk / 100.0)
-        rune_option_pct_hp_sum += (it.optionHp / 100.0)
-
-        # 룬 self 옵션이 있을 수 있으면(없으면 0)
-        if it.optionAtkself:
-            rune_option_self_atk += it.atkBase * (it.optionAtkself / 100.0)
-        if it.optionHpself:
-            rune_option_self_hp += it.hpBase * (it.optionHpself / 100.0)
-
-    rune_base_power = power_from_atk_hp(rune_base_atk, rune_base_hp)
-
-    # ---------- 옵션 베이스(요구사항): passive는 "가정값" 사용
-    base_atk_for_option = (
-        float(passive_atk_assume)
-        + float(agency_atk)
-        + float(character_atk_f)
-        + float(gear_base_atk)
-        + float(rune_base_atk)
-    )
-    base_hp_for_option = (
-        float(passive_hp_assume)
-        + float(agency_hp)
-        + float(character_hp_f)
-        + float(gear_base_hp)
-        + float(rune_base_hp)
-    )
-
-    # gear options
-    optionAtk_gear = base_atk_for_option * gear_option_pct_atk_sum + gear_option_self_atk
-    optionHp_gear = base_hp_for_option * gear_option_pct_hp_sum + gear_option_self_hp
-    gear_option_power = power_from_atk_hp(optionAtk_gear, optionHp_gear)
-
-    # rune options
-    optionAtk_rune = base_atk_for_option * rune_option_pct_atk_sum + rune_option_self_atk
-    optionHp_rune = base_hp_for_option * rune_option_pct_hp_sum + rune_option_self_hp
-    rune_option_power = power_from_atk_hp(optionAtk_rune, optionHp_rune)
-
-    # ---------- 최종: gear/rune power (요구사항)
-    gear_power = gear_base_power + gear_option_power
-    rune_power = rune_base_power + rune_option_power
-
-    # ---------- passive_power(그 외 옵션 전투력): 마지막 residual
-    calc_without_passive = (
-        agency_power
-        + character_power
-        + gear_base_power
-        + slotLv_power
-        + rune_base_power
-        + gear_option_power
-        + rune_option_power
-    )
-    passive_power = float(final_power) - float(calc_without_passive)
-
-    # ---------- table values (floor)
-    out = {
-        "total_power": _floor(final_power),
-
-        "agency_lv": int(agency_lv),
-        "agency_atk": _floor(agency_atk),
-        "agency_hp": _floor(agency_hp),
-        "agency_power": _floor(agency_power),
-
-        "character_atk": _floor(character_atk_f),
-        "character_hp": _floor(character_hp_f),
-        "character_power": _floor(character_power),
-
-        "gear_base_atk": _floor(gear_base_atk),
-        "gear_base_hp": _floor(gear_base_hp),
-        "gear_base_power": _floor(gear_base_power),
-
-        "slotLv_atk": _floor(slotLv_atk),
-        "slotLv_hp": _floor(slotLv_hp),
-        "slotLv_power": _floor(slotLv_power),
-
-        "rune_base_atk": _floor(rune_base_atk),
-        "rune_base_hp": _floor(rune_base_hp),
-        "rune_base_power": _floor(rune_base_power),
-
-        "option_base_atk(assumePassive)": _floor(base_atk_for_option),
-        "option_base_hp(assumePassive)": _floor(base_hp_for_option),
-
-        "gear_option_pct_atk_sum": gear_option_pct_atk_sum,
-        "gear_option_pct_hp_sum": gear_option_pct_hp_sum,
-        "optionAtk_gear": _floor(optionAtk_gear),
-        "optionHp_gear": _floor(optionHp_gear),
-        "gear_option_self_atk": _floor(gear_option_self_atk),
-        "gear_option_self_hp": _floor(gear_option_self_hp),
-        "gear_option_power": _floor(gear_option_power),
-
-        "rune_option_pct_atk_sum": rune_option_pct_atk_sum,
-        "rune_option_pct_hp_sum": rune_option_pct_hp_sum,
-        "optionAtk_rune": _floor(optionAtk_rune),
-        "optionHp_rune": _floor(optionHp_rune),
-        "rune_option_self_atk": _floor(rune_option_self_atk),
-        "rune_option_self_hp": _floor(rune_option_self_hp),
-        "rune_option_power": _floor(rune_option_power),
-
-        # 최종 구성요소
-        "gear_power": _floor(gear_power),
-        "rune_power": _floor(rune_power),
-
-        "passive_power": _floor(passive_power),
-        "other_option_power": _floor(passive_power),  # UI 명칭용
-
-        "equips_names": equip_names,
-        "runes_names": rune_names,
-    }
-
-    out["calc_sum_power"] = _floor(
-        out["agency_power"]
-        + out["character_power"]
-        + out["gear_base_power"]
-        + out["slotLv_power"]
-        + out["rune_base_power"]
-        + out["gear_option_power"]
-        + out["rune_option_power"]
-        + out["passive_power"]
-    )
-    out["gap_total_minus_calc"] = _floor(out["total_power"] - out["calc_sum_power"])
-    out["gap_label"] = _gap_label(out["gap_total_minus_calc"])
-
-    return out
-
-
-# =========================
-# Build raw snapshots per user
-# =========================
-def build_raw_snapshots_for_user(df: pd.DataFrame, user_label: str) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+def build_stage_rows_for_user(
+    df: pd.DataFrame,
+    user_label: str,
+    agency_power_map: Dict[int, float],
+    slotType_to_type_id: Dict[str, int],
+    item_map: Dict[str, ItemRow],
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     slot_lv_by_type_id: Dict[int, int] = {}
     agency_lv_current: int = 0
 
@@ -638,8 +482,10 @@ def build_raw_snapshots_for_user(df: pd.DataFrame, user_label: str) -> Tuple[pd.
                 continue
             validation["first_clear_rows"] += 1
 
-            equips = [str(x) for x in (gs.get("equips", []) or [])]
-            runes = [str(x) for x in (gs.get("runes", []) or [])]
+            equips = gs.get("equips", []) or []
+            runes = gs.get("runes", []) or []
+            equips = [str(x) for x in equips]
+            runes = [str(x) for x in runes]
 
             # Validate item ids + slotType mapping
             for eid in equips:
@@ -655,15 +501,54 @@ def build_raw_snapshots_for_user(df: pd.DataFrame, user_label: str) -> Tuple[pd.
                 if not it:
                     validation["unknown_item_ids_in_runes"].add(rid)
 
+            stage_lv = int(r.get("stage_lv", 0) or 0)
+            total_power = float(r.get("combat_power", 0.0) or 0.0)
+
+            (
+                equip_power,
+                rune_power,
+                equip_base_power,
+                equip_level_power,
+                optionAtk_power_total,
+                optionHp_power_total,
+                optionAtk_power_self,
+                optionHp_power_self,
+                equip_names,
+                rune_names,
+                equip_grades,
+                rune_grades,
+            ) = sum_equip_rune_power(
+                equip_ids=equips,
+                rune_ids=runes,
+                slot_lv_by_type_id=slot_lv_by_type_id,
+                slotType_to_type_id=slotType_to_type_id,
+                item_map=item_map,
+            )
+
+            agency_power = float(agency_power_map.get(int(agency_lv_current), 0.0))
+
             row = {
                 "user": user_label,
                 "time": float(r.get("time", 0.0) or 0.0),
-                "stage_lv": int(r.get("stage_lv", 0) or 0),
+                "stage_lv": stage_lv,
                 "stage_id": str(r.get("stage_id", "")),
-                "total_power": float(r.get("combat_power", 0.0) or 0.0),
+                "total_power": total_power,
+                "equip_power": equip_power,
+                "rune_power": rune_power,
                 "agency_lv": int(agency_lv_current),
+                "agency_power": agency_power,
+                "equip_base_power": equip_base_power,
+                "equip_level_power": equip_level_power,
                 "equips_ids": equips,
                 "runes_ids": runes,
+                "equips_names": equip_names,
+                "runes_names": rune_names,
+                "equips_grades": equip_grades,
+                "runes_grades": rune_grades,
+                "optionAtk_power_total": optionAtk_power_total,
+                "optionHp_power_total": optionHp_power_total,
+                "optionAtk_power_self": optionAtk_power_self,
+                "optionHp_power_self": optionHp_power_self,
             }
             row.update(slot_levels_to_columns(slot_lv_by_type_id))
             rows.append(row)
@@ -672,7 +557,8 @@ def build_raw_snapshots_for_user(df: pd.DataFrame, user_label: str) -> Tuple[pd.
     if out.empty:
         return out, validation
 
-    out = out.sort_values(["stage_lv", "time"]).drop_duplicates(subset=["user", "stage_lv"], keep="first").reset_index(drop=True)
+    out = out.sort_values(["stage_lv", "time"]).drop_duplicates(subset=["user", "stage_lv"], keep="first")
+    out = out.reset_index(drop=True)
 
     validation["stage_clear_rows_emitted"] = len(out)
     for k in ["unknown_item_ids_in_equips", "unknown_item_ids_in_runes", "missing_slotType_mapping"]:
@@ -680,7 +566,11 @@ def build_raw_snapshots_for_user(df: pd.DataFrame, user_label: str) -> Tuple[pd.
     return out, validation
 
 
-def build_breakdown_tables_for_snapshot(snapshot_row: pd.Series) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def build_breakdown_tables_for_snapshot(
+    snapshot_row: pd.Series,
+    slotType_to_type_id: Dict[str, int],
+    item_map: Dict[str, ItemRow],
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     slot_levels = []
     slot_lv_by_type_id = {}
     for i in range(1, 7):
@@ -699,48 +589,44 @@ def build_breakdown_tables_for_snapshot(snapshot_row: pd.Series) -> Tuple[pd.Dat
             equip_rows.append({
                 "name": "(lookup missing)",
                 "equip_id": str(eid),
+                "gradeType": "",
                 "slotType": "",
                 "slot_type_id": None,
                 "slot_lv": None,
-                "atkBase": 0.0,
-                "hpBase": 0.0,
-                "atkInc": 0.0,
-                "hpInc": 0.0,
-                "slotLv_atk": 0.0,
-                "slotLv_hp": 0.0,
-                "gear_base_power": 0.0,
-                "slotLv_power": 0.0,
-                "optionAtk%": 0,
-                "optionHp%": 0,
-                "optionAtkself%": 0,
-                "optionHpself%": 0,
+                "atk": 0.0,
+                "hp": 0.0,
+                "power": 0.0,
+                "base_power(slot_lv=0)": 0.0,
+                "level_power": 0.0,
+                "optionAtk(ratio)": 0.0,
+                "optionHp(ratio)": 0.0,
+                "optionAtkBase(ratio)": 0.0,
+                "optionHpBase(ratio)": 0.0,
             })
             continue
 
         type_id = slotType_to_type_id.get(it.slotType)
         lv = slot_lv_by_type_id.get(int(type_id), 0) if type_id is not None else 0
 
-        slot_atk = it.atkInc * lv
-        slot_hp = it.hpInc * lv
+        atk, hp, p = calc_item_power(it, lv, is_equip=True)
+        _, _, base = calc_item_power(it, 0, is_equip=True)
 
         equip_rows.append({
             "name": it.name,
-            "equip_id": it.id,
+            "equip_id": it.id,  # 검증용 유지
+            "gradeType": it.gradeType,
             "slotType": it.slotType,
             "slot_type_id": type_id,
             "slot_lv": lv,
-            "atkBase": it.atkBase,
-            "hpBase": it.hpBase,
-            "atkInc": it.atkInc,
-            "hpInc": it.hpInc,
-            "slotLv_atk": slot_atk,
-            "slotLv_hp": slot_hp,
-            "gear_base_power": power_from_atk_hp(it.atkBase, it.hpBase),
-            "slotLv_power": power_from_atk_hp(slot_atk, slot_hp),
-            "optionAtk%": it.optionAtk,
-            "optionHp%": it.optionHp,
-            "optionAtkself%": it.optionAtkself,
-            "optionHpself%": it.optionHpself,
+            "atk": atk,
+            "hp": hp,
+            "power": p,
+            "base_power(slot_lv=0)": base,
+            "level_power": p - base,
+            "optionAtk(ratio)": it.optionAtk,
+            "optionHp(ratio)": it.optionHp,
+            "optionAtkBase(ratio)": it.optionAtkBase,
+            "optionHpBase(ratio)": it.optionHpBase,
         })
 
     equip_df = pd.DataFrame(equip_rows)
@@ -754,80 +640,124 @@ def build_breakdown_tables_for_snapshot(snapshot_row: pd.Series) -> Tuple[pd.Dat
             rune_rows.append({
                 "name": "(lookup missing)",
                 "rune_id": str(rid),
+                "gradeType": "",
                 "slotType": "",
-                "atkBase": 0.0,
-                "hpBase": 0.0,
-                "rune_base_power": 0.0,
-                "optionAtk%": 0,
-                "optionHp%": 0,
-                "optionAtkself%": 0,
-                "optionHpself%": 0,
+                "atk": 0.0,
+                "hp": 0.0,
+                "power": 0.0,
+                "optionAtk(ratio)": 0.0,
+                "optionHp(ratio)": 0.0,
             })
             continue
 
+        atk, hp, p = calc_item_power(it, 0, is_equip=False)
         rune_rows.append({
             "name": it.name,
-            "rune_id": it.id,
+            "rune_id": it.id,  # 검증용 유지
+            "gradeType": it.gradeType,
             "slotType": it.slotType,
-            "atkBase": it.atkBase,
-            "hpBase": it.hpBase,
-            "rune_base_power": power_from_atk_hp(it.atkBase, it.hpBase),
-            "optionAtk%": it.optionAtk,
-            "optionHp%": it.optionHp,
-            "optionAtkself%": it.optionAtkself,
-            "optionHpself%": it.optionHpself,
+            "atk": atk,
+            "hp": hp,
+            "power": p,
+            "optionAtk(ratio)": it.optionAtk,
+            "optionHp(ratio)": it.optionHp,
         })
 
     rune_df = pd.DataFrame(rune_rows)
     return slot_levels_df, equip_df, rune_df
 
 
-def build_power_long_df(df: pd.DataFrame, mode: str) -> pd.DataFrame:
-    # mode: "overall"(has user) or "avg"(no user)
-    series = [
-        ("전체 전투력", "total_power"),
-        ("장비 전투력", "gear_power"),
-        ("룬 전투력", "rune_power"),
-        ("장비 레벨 전투력", "slotLv_power"),
-        ("에이전시 레벨 전투력", "agency_power"),
-        ("그 외 옵션 전투력", "other_option_power"),
-    ]
+def names_join(xs: Any) -> str:
+    if isinstance(xs, list):
+        return ", ".join([str(x) for x in xs])
+    if xs is None or (isinstance(xs, float) and np.isnan(xs)):
+        return ""
+    return str(xs)
 
-    rows = []
-    for label, col in series:
-        if col not in df.columns:
+
+# =========================
+# Sidebar: Inputs
+# =========================
+with st.sidebar:
+    st.header("입력")
+
+    max_stage = st.number_input("최대 스테이지", min_value=1, max_value=2000, value=240, step=10)
+
+    user_files = st.file_uploader(
+        "유저 CSV 업로드 (1개~N개)",
+        type=["csv"],
+        accept_multiple_files=True,
+    )
+
+    agency_lookup_file = st.file_uploader(
+        "룩업 CSV 1 (Agency) — 컬럼: lvl, agency_power",
+        type=["csv"],
+        accept_multiple_files=False,
+    )
+
+    item_lookup_file = st.file_uploader(
+        "룩업 CSV 2 (Items: Equip+Rune) — 컬럼: id, name, slotType, atkBase, atkInc, hpBase, hpInc, optionAtk, optionHp, optionAtkBase, optionHpBase, gradeType",
+        type=["csv"],
+        accept_multiple_files=False,
+    )
+
+    st.divider()
+    st.subheader("slotType 매핑")
+    st.caption("Item.slotType 문자열 → 유저 CSV의 slot_type(1~6)로 매핑")
+
+    # 요청 반영: 기본 slotType + 매핑(편집 가능 유지)
+    # Hat, Coat, Ring, Neck, Belt, Boots => 1~6
+    default_slotType_mapping = {
+        "Hat": 1,
+        "Coat": 2,
+        "Ring": 3,
+        "Neck": 4,
+        "Belt": 5,
+        "Boots": 6,
+    }
+    default_lines = "\n".join([f"{k}={v}" for k, v in default_slotType_mapping.items()])
+    mapping_txt = st.text_area("매핑 편집", value=default_lines, height=160)
+
+    slotType_to_type_id: Dict[str, int] = {}
+    for line in mapping_txt.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
             continue
-        tmp = df[["stage_lv"]].copy()
-        tmp["series"] = label
-        tmp["value"] = df[col].astype(float)
-        if mode != "avg":
-            tmp["user"] = df["user"].astype(str)
-        rows.append(tmp)
-
-    if not rows:
-        return pd.DataFrame()
-
-    out = pd.concat(rows, ignore_index=True)
-
-    # user 정렬(전투력 높은 순서로)
-    if mode != "avg" and "user" in df.columns and len(df):
-        last_stage = int(df["stage_lv"].max())
-        ranking = (
-            df[df["stage_lv"] == last_stage]
-            .groupby("user")["total_power"]
-            .max()
-            .sort_values(ascending=False)
-        )
-        user_order = ranking.index.tolist()
-        out["user"] = pd.Categorical(out["user"], categories=user_order, ordered=True)
-
-    return out
+        k, v = line.split("=", 1)
+        k = k.strip()
+        try:
+            slotType_to_type_id[k] = int(v.strip())
+        except Exception:
+            continue
+    if not slotType_to_type_id:
+        slotType_to_type_id = default_slotType_mapping
 
 
 # =========================
-# Run pipeline
+# Validate required uploads
 # =========================
-all_raw = []
+if not user_files:
+    st.info("왼쪽에서 유저 CSV(1개 이상)를 업로드하세요.")
+    st.stop()
+if agency_lookup_file is None:
+    st.info("왼쪽에서 Agency 룩업 CSV(lvl, agency_power)를 업로드하세요.")
+    st.stop()
+if item_lookup_file is None:
+    st.info("왼쪽에서 Item 룩업 CSV(id, name, slotType, atkBase, atkInc, hpBase, hpInc, option..., gradeType)를 업로드하세요.")
+    st.stop()
+
+try:
+    agency_power_map = load_agency_lookup(agency_lookup_file)
+    item_map = load_item_lookup(item_lookup_file)
+except Exception as e:
+    st.error(f"룩업 파일 로딩 실패: {e}")
+    st.stop()
+
+
+# =========================
+# Build per-user snapshots
+# =========================
+all_rows = []
 validations = []
 errors = []
 
@@ -835,16 +765,22 @@ for f in user_files:
     user_label = f.name.replace(".csv", "")
     try:
         udf = parse_user_csv(f)
-        raw, vinfo = build_raw_snapshots_for_user(udf, user_label=user_label)
+        stage_rows, vinfo = build_stage_rows_for_user(
+            df=udf,
+            user_label=user_label,
+            agency_power_map=agency_power_map,
+            slotType_to_type_id=slotType_to_type_id,
+            item_map=item_map,
+        )
         validations.append(vinfo)
-        if not raw.empty:
-            all_raw.append(raw)
+        if not stage_rows.empty:
+            all_rows.append(stage_rows)
         else:
             errors.append(f"{user_label}: first_clear game_end 스냅샷이 없습니다.")
     except Exception as e:
         errors.append(f"{user_label}: 처리 실패 ({e})")
 
-if not all_raw:
+if not all_rows:
     st.error("유효한 stage clear 데이터가 없습니다. (조건: game_end + game_state.first_clear == true)")
     if errors:
         with st.expander("처리 오류", expanded=True):
@@ -852,30 +788,44 @@ if not all_raw:
                 st.write(f"- {msg}")
     st.stop()
 
-df_raw_all = pd.concat(all_raw, ignore_index=True)
-df_raw_all = df_raw_all[(df_raw_all["stage_lv"] >= 1) & (df_raw_all["stage_lv"] <= int(max_stage))].copy()
+df_all = pd.concat(all_rows, ignore_index=True)
+
+# Stage range filter
+df_all = df_all[(df_all["stage_lv"] >= 1) & (df_all["stage_lv"] <= int(max_stage))].copy()
+
+# Derived sums + gap label
+df_all["calc_sum_power"] = (
+    df_all["equip_power"]
+    + df_all["rune_power"]
+    + df_all["agency_power"]
+    + df_all["optionAtk_power_total"]
+    + df_all["optionHp_power_total"]
+    + df_all["optionAtk_power_self"]
+    + df_all["optionHp_power_self"]
+)
+df_all["gap_total_minus_calc"] = df_all["total_power"] - df_all["calc_sum_power"]
 
 
-# compute components
-out_rows = []
-for _, row in df_raw_all.iterrows():
-    slot_lv_by_type = {i: int(row.get(f"slot_lv_{i}", 0) or 0) for i in range(1, 7)}
-    comp = compute_components_for_snapshot(
-        equips=row.get("equips_ids", []) or [],
-        runes=row.get("runes_ids", []) or [],
-        slot_lv_by_type_id=slot_lv_by_type,
-        agency_lv=int(row.get("agency_lv", 0) or 0),
-        final_power=float(row.get("total_power", 0.0) or 0.0),
-    )
-    merged = dict(row.to_dict())
-    merged.update(comp)
-    merged["equips"] = names_join(comp["equips_names"])
-    merged["runes"] = names_join(comp["runes_names"])
-    out_rows.append(merged)
+def _gap_label(g: float) -> str:
+    gi = int(round(float(g)))
+    if gi == 0:
+        return "정확"
+    if gi > 0:
+        return f"부족 {gi}"
+    return f"초과 {abs(gi)}"
 
-df_all = pd.DataFrame(out_rows)
 
-# debug id strings
+df_all["gap_label"] = df_all["gap_total_minus_calc"].apply(_gap_label)
+
+# Name-based list strings for tables
+df_all["equips"] = df_all["equips_names"].apply(names_join)
+df_all["runes"] = df_all["runes_names"].apply(names_join)
+
+# Grades list strings (table/debug)
+df_all["equips_gradeTypes"] = df_all["equips_grades"].apply(names_join)
+df_all["runes_gradeTypes"] = df_all["runes_grades"].apply(names_join)
+
+# Keep ID strings too (for debugging)
 df_all["equips_ids_str"] = df_all["equips_ids"].apply(names_join)
 df_all["runes_ids_str"] = df_all["runes_ids"].apply(names_join)
 
@@ -890,38 +840,42 @@ tab_overall, tab_user, tab_avg, tab_validate = st.tabs(["전체(그래프)", "�
 # Tab: Overall graphs + full table
 # -------------------------
 with tab_overall:
-    c1, c2, c3 = st.columns([1, 1, 2])
+    c1, c2, c3, c4 = st.columns([1, 1, 1, 2])
     with c1:
         stage_min = st.number_input("stage min", min_value=1, max_value=int(max_stage), value=1, step=1, key="overall_stage_min")
     with c2:
         stage_max = st.number_input("stage max", min_value=1, max_value=int(max_stage), value=int(max_stage), step=1, key="overall_stage_max")
     with c3:
+        metric = st.selectbox(
+            "지표",
+            options=[
+                "total_power", "equip_power", "rune_power", "agency_power",
+                "equip_base_power", "equip_level_power",
+                "calc_sum_power", "gap_total_minus_calc",
+                "optionAtk_power_total", "optionHp_power_total", "optionAtk_power_self", "optionHp_power_self"
+            ],
+            index=0,
+            key="overall_metric",
+        )
+    with c4:
         users_sel = st.multiselect("유저(선택 시 필터)", options=sorted(df_all["user"].unique()), default=[], key="overall_users")
 
     view = df_all[(df_all["stage_lv"] >= int(stage_min)) & (df_all["stage_lv"] <= int(stage_max))].copy()
     if users_sel:
         view = view[view["user"].isin(users_sel)].copy()
 
-    st.subheader("전체 그래프 (유저별처럼 구성요소를 한 그래프에서 토글)")
-    long_df = build_power_long_df(view.sort_values(["user", "stage_lv"]), mode="overall")
-    if long_df.empty:
-        st.info("그래프를 그릴 데이터가 없습니다.")
-    else:
-        # 여러 유저를 한 화면에서 보기 좋게: facet으로 유저별 분리 + series 토글
-        fig = px.line(
-            long_df,
-            x="stage_lv",
-            y="value",
-            color="series",
-            facet_col="user",
-            facet_col_wrap=2,
-            markers=False,
-            title="(범례 클릭) 전체 전투력 구성요소 토글",
-        )
-        fig.update_layout(height=850)
-        st.plotly_chart(fig, use_container_width=True)
+    fig = px.line(
+        view.sort_values(["user", "stage_lv"]),
+        x="stage_lv",
+        y=metric,
+        color="user",
+        markers=False,
+        title=f"Stage vs {metric}",
+    )
+    st.plotly_chart(fig, use_container_width=True)
 
     st.divider()
+
     st.subheader("전체 테이블 (유저×스테이지 스냅샷)")
     with st.expander("표 칼럼 표시 설정", expanded=False):
         all_cols = list(view.columns)
@@ -939,10 +893,22 @@ with tab_user:
 
     udf = df_all[df_all["user"] == user_sel].sort_values("stage_lv").copy()
 
-    c1, c2 = st.columns([1, 2])
+    c1, c2, c3 = st.columns([1, 1, 2])
     with c1:
-        show_points = st.checkbox("포인트 표시", value=True, key="user_points")
+        metric_u = st.selectbox(
+            "지표",
+            options=[
+                "total_power", "equip_power", "rune_power", "agency_power",
+                "equip_base_power", "equip_level_power",
+                "calc_sum_power", "gap_total_minus_calc",
+                "optionAtk_power_total", "optionHp_power_total", "optionAtk_power_self", "optionHp_power_self"
+            ],
+            index=0,
+            key="user_metric",
+        )
     with c2:
+        show_points = st.checkbox("포인트 표시", value=True, key="user_points")
+    with c3:
         stage_focus = st.selectbox(
             "상세 확인할 스테이지(선택)",
             options=udf["stage_lv"].tolist(),
@@ -950,44 +916,40 @@ with tab_user:
             key="user_stage_focus",
         )
 
-    st.subheader("유저별 그래프 (구성요소 토글)")
-    long_u = build_power_long_df(udf, mode="overall")
     fig2 = px.line(
-        long_u,
+        udf,
         x="stage_lv",
-        y="value",
-        color="series",
+        y=metric_u,
         markers=bool(show_points),
-        title=f"{user_sel}: (범례 클릭) 구성요소 토글",
+        title=f"{user_sel}: Stage vs {metric_u}",
     )
     st.plotly_chart(fig2, use_container_width=True)
 
     st.divider()
-    st.subheader("선택 스테이지 상세 분해 (장비/룬/슬롯레벨/옵션 확인)")
+
+    st.subheader("선택 스테이지 상세 분해 (장비/룬/슬롯레벨 확인)")
 
     snap = udf[udf["stage_lv"] == int(stage_focus)].iloc[0]
-    slot_levels_df, equip_df, rune_df = build_breakdown_tables_for_snapshot(snap)
-
-    m1, m2, m3, m4, m5, m6 = st.columns(6)
-    m1.metric("전체 전투력", f"{snap['total_power']}")
-    m2.metric("에이전시", f"{snap['agency_power']}")
-    m3.metric("캐릭터", f"{snap['character_power']}")
-    m4.metric("장비 전투력", f"{snap['gear_power']}")
-    m5.metric("장비 레벨 전투력", f"{snap['slotLv_power']}")
-    m6.metric("룬 전투력", f"{snap['rune_power']}")
-
-    m7, m8, m9, m10, m11, m12 = st.columns(6)
-    m7.metric("장비 옵션 전투력", f"{snap['gear_option_power']}")
-    m8.metric("룬 옵션 전투력", f"{snap['rune_option_power']}")
-    m9.metric("그 외 옵션 전투력(=passive)", f"{snap['other_option_power']}")
-    m10.metric("합산(calc_sum)", f"{snap['calc_sum_power']}")
-    m11.metric("갭", f"{snap['gap_total_minus_calc']}")
-    m12.metric("갭 라벨", snap["gap_label"])
-
-    st.caption(
-        "옵션 베이스(ATK/HP)에는 passive 가정값(passiveAtk/HP assume)이 들어갑니다. "
-        "passive_power(그 외 옵션 전투력)는 마지막 residual로 계산됩니다."
+    slot_levels_df, equip_df, rune_df = build_breakdown_tables_for_snapshot(
+        snapshot_row=snap,
+        slotType_to_type_id=slotType_to_type_id,
+        item_map=item_map,
     )
+
+    # Inline metrics (validation-friendly)
+    s1, s2, s3, s4 = st.columns(4)
+    s1.metric("total_power(로그)", f"{snap['total_power']:.0f}")
+    s2.metric("equip_power(계산)", f"{snap['equip_power']:.0f}")
+    s3.metric("rune_power(계산)", f"{snap['rune_power']:.0f}")
+    s4.metric("agency_power(룩업)", f"{snap['agency_power']:.0f}")
+
+    s5, s6, s7, s8 = st.columns(4)
+    s5.metric("calc_sum_power", f"{snap['calc_sum_power']:.0f}")
+    s6.metric("gap_total_minus_calc", f"{snap['gap_total_minus_calc']:.0f}")
+    s7.metric("gap_label", snap["gap_label"])
+    s8.metric("agency_lv", str(int(snap["agency_lv"])))
+
+    st.caption("gap_total_minus_calc = total_power - calc_sum_power. 0이면 '정확'.")
 
     cA, cB = st.columns([1, 2], gap="large")
     with cA:
@@ -1018,26 +980,38 @@ with tab_avg:
         .groupby("stage_lv", as_index=False)
         .agg(
             n_users=("user", "nunique"),
-            total_power=("total_power", "mean"),
-            gear_power=("gear_power", "mean"),
-            rune_power=("rune_power", "mean"),
-            slotLv_power=("slotLv_power", "mean"),
-            agency_power=("agency_power", "mean"),
-            other_option_power=("other_option_power", "mean"),
+            avg_total_power=("total_power", "mean"),
+            avg_equip_power=("equip_power", "mean"),
+            avg_rune_power=("rune_power", "mean"),
+            avg_agency_power=("agency_power", "mean"),
+            avg_calc_sum_power=("calc_sum_power", "mean"),
+            avg_gap=("gap_total_minus_calc", "mean"),
+            top_gear_grade=("equips_grades", _mode_from_list_series),
+            top_rune_grade=("runes_grades", _mode_from_list_series),
         )
         .sort_values("stage_lv")
     )
 
-    st.subheader("스테이지 평균 그래프 (구성요소 토글)")
-    long_a = build_power_long_df(agg.rename(columns={"total_power": "total_power"}), mode="avg")
-    fig3 = px.line(
-        long_a,
-        x="stage_lv",
-        y="value",
-        color="series",
-        title="스테이지 평균: (범례 클릭) 구성요소 토글",
-    )
-    st.plotly_chart(fig3, use_container_width=True)
+    c1, c2 = st.columns([1, 3])
+    with c1:
+        metric_a = st.selectbox(
+            "평균 지표",
+            options=[
+                "avg_total_power", "avg_equip_power", "avg_rune_power", "avg_agency_power",
+                "avg_calc_sum_power", "avg_gap"
+            ],
+            index=0,
+            key="avg_metric",
+        )
+    with c2:
+        fig3 = px.line(
+            agg,
+            x="stage_lv",
+            y=metric_a,
+            title=f"Stage vs {metric_a}",
+        )
+        st.plotly_chart(fig3, use_container_width=True)
+
     st.dataframe(agg, use_container_width=True, height=520)
 
 
