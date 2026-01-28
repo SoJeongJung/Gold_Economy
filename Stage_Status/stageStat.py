@@ -222,31 +222,6 @@ def _extract_id_list(v: Any) -> List[str]:
         return [str(int(v))]
     return []
 
-def _ensure_str_list(v: Any) -> List[str]:
-    """
-    pandas row에서 equips_ids/runes_ids가 문자열로 굳는 경우가 있어 강제로 list[str]로 복원.
-    """
-    if v is None or (isinstance(v, float) and np.isnan(v)):
-        return []
-    if isinstance(v, list):
-        return [str(x).strip() for x in v if str(x).strip() != ""]
-    if isinstance(v, (tuple, set)):
-        return [str(x).strip() for x in list(v) if str(x).strip() != ""]
-    if isinstance(v, str):
-        s = v.strip()
-        if s == "":
-            return []
-        # JSON/파이썬 리터럴 형태 문자열일 수 있음
-        parsed = _safe_json_loads(s)
-        if isinstance(parsed, list):
-            return [str(x).strip() for x in parsed if str(x).strip() != ""]
-        # 콤마 문자열일 수도 있음
-        parts = [p.strip() for p in s.replace(";", ",").split(",") if p.strip() != ""]
-        return parts
-    # 기타(단일 값)
-    return [str(v).strip()]
-
-
 
 # =========================
 # Data models
@@ -726,9 +701,6 @@ def build_stage_rows_for_user(
             # ✅ equips/runes는 반드시 game_state에서 가져옴(요구사항)
             equips = _extract_id_list(gs.get("equips"))
             runes = _extract_id_list(gs.get("runes"))
-            equips = [str(x).strip() for x in equips if str(x).strip() != ""]
-            runes  = [str(x).strip() for x in runes  if str(x).strip() != ""]
-
 
             # Validate item ids + slotType mapping
             for eid in equips:
@@ -892,9 +864,8 @@ def build_breakdown_tables_for_snapshot(
         slot_levels.append({"slot_type_id": i, "slot_lv": lv})
     slot_levels_df = pd.DataFrame(slot_levels)
 
-    equips_ids = _ensure_str_list(snapshot_row.get("equips_ids", []))
-    runes_ids  = _ensure_str_list(snapshot_row.get("runes_ids", []))
-
+    equips_ids = snapshot_row.get("equips_ids", [])
+    runes_ids = snapshot_row.get("runes_ids", [])
 
     equip_rows = []
     for eid in equips_ids:
