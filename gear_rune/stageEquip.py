@@ -2,6 +2,7 @@
 import streamlit as st
 import pandas as pd
 from typing import List, Tuple, Dict, Optional
+import re
 
 # =========================================================
 # Page
@@ -27,8 +28,36 @@ SEGMENTS = [
 # Utils
 # =========================================================
 def _normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    컬럼명 공백/대소문자/하이픈 등 흔한 변형을 안전하게 정리.
+    (사용자가 공백 문제를 해결했다고 했지만, 실전에서 재발 방지용으로 유지)
+    """
     df = df.copy()
-    df.columns = [c.strip() for c in df.columns]
+
+    def canon(c: str) -> str:
+        c = str(c).strip().lower()
+        c = re.sub(r"\s+", "", c)      # 모든 공백 제거
+        c = c.replace("-", "_")        # 하이픈 -> 언더스코어
+        c = re.sub(r"_+", "_", c)      # 연속 언더스코어 정리
+        return c
+
+    df.columns = [canon(c) for c in df.columns]
+
+    rename_map = {
+        "equipid": "equip_id",
+        "equipmentid": "equip_id",
+        "equip_id": "equip_id",
+
+        "runeid": "rune_id",
+        "rune_id": "rune_id",
+
+        "stageid": "stage_id",
+        "stage_id": "stage_id",
+
+        "usecount": "use_count",
+        "use_count": "use_count",
+    }
+    df = df.rename(columns={c: rename_map.get(c, c) for c in df.columns})
     return df
 
 def _to_int_series(s: pd.Series) -> pd.Series:
@@ -62,6 +91,19 @@ def safe_merge(master: pd.DataFrame, usage: pd.DataFrame, left_id_col: str, mast
         st.warning(f"{master_label}: 마스터 조인 실패 {missing_cnt}건 (id 미매칭). name/grade/type이 비어있을 수 있어요.")
     return merged
 
+def sort_stage_id(df: pd.DataFrame, col: str = "stage_id") -> pd.DataFrame:
+    """
+    stage_id를 1,2,3,... 숫자 순서로 정렬 (문자열 정렬 1,10,2 방지)
+    숫자 변환 불가한 값은 뒤로 보냄.
+    """
+    if df is None or df.empty or col not in df.columns:
+        return df
+
+    tmp = df.copy()
+    tmp["_stage_num"] = pd.to_numeric(tmp[col], errors="coerce")
+    tmp = tmp.sort_values(by=["_stage_num", col], ascending=[True, True]).drop(columns=["_stage_num"])
+    return tmp
+
 # =========================================================
 # Compute
 # =========================================================
@@ -85,12 +127,13 @@ def top_equips_by_type_per_stage(equip_usage: pd.DataFrame, master: pd.DataFrame
     merged = safe_merge(m, agg, "equip_id", "장비")
     merged["type"] = merged["type"].fillna("Unknown").astype(str)
 
+    # stage_id, type별 use_count 내림차순 1등
     merged = merged.sort_values(["stage_id", "type", "use_count"], ascending=[True, True, False])
     top1 = merged.groupby(["stage_id", "type"], as_index=False).head(1)
 
     out = top1[["stage_id", "type", "equip_id", "name", "grade", "use_count"]].copy()
     out = out.rename(columns={"equip_id": "id", "use_count": "use_count_sum"})
-    out = out.sort_values(["stage_id", "type"])
+    out = sort_stage_id(out, "stage_id")
     return out
 
 def top_runes_per_stage(rune_usage: pd.DataFrame, master: pd.DataFrame, top_n: int = 6) -> pd.DataFrame:
@@ -117,40 +160,56 @@ def top_runes_per_stage(rune_usage: pd.DataFrame, master: pd.DataFrame, top_n: i
 
     out = topn[["stage_id", "rune_id", "name", "grade", "use_count"]].copy()
     out = out.rename(columns={"rune_id": "id", "use_count": "use_count_sum"})
+    out = sort_stage_id(out, "stage_id")
     return out
 
-def stage_pivot_view(df: pd.DataFrame, kind: str) -> pd.DataFrame:
+def rune_rank_wide_view(rune_top: pd.DataFrame) -> pd.DataFrame:
     """
-    stage별로 Top 1~6을 가로로 보여주는 뷰
-    - equip: type 기준 정렬(타입 6개)
-    - rune : use_count 내림차순
+    룬: stage별 Top 1~6을 가로로
     """
-    if df is None or df.empty:
+    if rune_top is None or rune_top.empty:
         return pd.DataFrame()
 
-    tmp = df.copy()
-    if kind == "equip":
-        tmp = tmp.sort_values(["stage_id", "type"])
-    else:
-        tmp = tmp.sort_values(["stage_id", "use_count_sum"], ascending=[True, False])
-
+    tmp = rune_top.copy()
+    tmp = tmp.sort_values(["stage_id", "use_count_sum"], ascending=[True, False])
     tmp["rank"] = tmp.groupby("stage_id").cumcount() + 1
 
-    if kind == "equip":
-        tmp["label"] = tmp.apply(
-            lambda r: f"{r.get('type','')}: {r.get('name','')} (grade={r.get('grade','')}, id={r.get('id','')}, cnt={r.get('use_count_sum','')})",
-            axis=1
-        )
-    else:
-        tmp["label"] = tmp.apply(
-            lambda r: f"{r.get('name','')} (grade={r.get('grade','')}, id={r.get('id','')}, cnt={r.get('use_count_sum','')})",
-            axis=1
-        )
+    tmp["label"] = tmp.apply(
+        lambda r: f"{r.get('name','')} (grade={r.get('grade','')}, id={r.get('id','')}, cnt={r.get('use_count_sum','')})",
+        axis=1
+    )
 
     pv = tmp.pivot_table(index="stage_id", columns="rank", values="label", aggfunc="first")
     pv.columns = [f"Top {int(c)}" for c in pv.columns]
     pv = pv.reset_index()
+    pv = sort_stage_id(pv, "stage_id")
     return pv
+
+def equips_type_wide_view(equip_top: pd.DataFrame) -> pd.DataFrame:
+    """
+    장비: stage별 type 6종을 열로 펼친 wide 테이블
+    (stage_id 행 / type 열)
+    """
+    if equip_top is None or equip_top.empty:
+        return pd.DataFrame()
+
+    tmp = equip_top.copy()
+    tmp["label"] = tmp.apply(
+        lambda r: f"{r.get('name','')} (grade={r.get('grade','')}, id={r.get('id','')}, cnt={r.get('use_count_sum','')})",
+        axis=1
+    )
+
+    wide = tmp.pivot_table(
+        index="stage_id",
+        columns="type",
+        values="label",
+        aggfunc="first"
+    ).reset_index()
+
+    cols = ["stage_id"] + sorted([c for c in wide.columns if c != "stage_id"])
+    wide = wide[cols]
+    wide = sort_stage_id(wide, "stage_id")
+    return wide
 
 # =========================================================
 # UI: Upload
@@ -228,6 +287,7 @@ def render_segment(seg_key: str, seg_name: str, equip_file, rune_file):
     equip_usage = None
     rune_usage = None
 
+    # ---------- Load + Validate ----------
     if equip_file is not None:
         equip_usage = _normalize_cols(pd.read_csv(equip_file))
         ok, msg = validate_cols(equip_usage, REQUIRED_EQUIP_COLS, f"{seg_name} - 장비 로그")
@@ -246,43 +306,53 @@ def render_segment(seg_key: str, seg_name: str, equip_file, rune_file):
         st.warning("이 세그먼트는 업로드된 파일이 없거나(혹은 컬럼 오류로) 처리할 수 없습니다.")
         return
 
-    # ✅ 빈 DF라도 '컬럼을 가진' 형태로 초기화 (KeyError 방지)
+    # ---------- Compute ----------
     equip_top = _empty_equip_top()
     rune_top = _empty_rune_top()
-    equip_pv = pd.DataFrame()
-    rune_pv = pd.DataFrame()
+
+    equip_wide = pd.DataFrame()
+    rune_wide = pd.DataFrame()
 
     if equip_usage is not None:
         equip_top = top_equips_by_type_per_stage(equip_usage, master)
-        equip_pv = stage_pivot_view(equip_top, kind="equip")
+        equip_wide = equips_type_wide_view(equip_top)
 
     if rune_usage is not None:
         rune_top = top_runes_per_stage(rune_usage, master, top_n=6)
-        rune_pv = stage_pivot_view(rune_top, kind="rune")
+        rune_wide = rune_rank_wide_view(rune_top)
 
+    # ---------- Tabs ----------
     inner_tabs = st.tabs(["Stage별 요약(가로)", "Stage 상세(세로)", "다운로드"])
 
     with inner_tabs[0]:
         c1, c2 = st.columns(2)
         with c1:
-            st.markdown("### Stage별 Top 장비 6개 (타입별 1개)")
-            if equip_pv.empty:
+            st.markdown("### Stage별 Top 장비 6개 (타입별 1개, type이 열로 표시)")
+            if equip_wide.empty:
                 st.info("장비 로그가 업로드되지 않았거나, 계산 결과가 없습니다.")
             else:
-                st.dataframe(equip_pv, use_container_width=True)
+                st.dataframe(equip_wide, use_container_width=True)
 
         with c2:
-            st.markdown("### Stage별 Top 룬 6개")
-            if rune_pv.empty:
+            st.markdown("### Stage별 Top 룬 6개 (Top1~Top6)")
+            if rune_wide.empty:
                 st.info("룬 로그가 업로드되지 않았거나, 계산 결과가 없습니다.")
             else:
-                st.dataframe(rune_pv, use_container_width=True)
+                st.dataframe(rune_wide, use_container_width=True)
 
     with inner_tabs[1]:
-        # ✅ stage union도 컬럼 존재/empty 안전하게
         equip_stages = set(equip_top["stage_id"].astype(str)) if ("stage_id" in equip_top.columns and not equip_top.empty) else set()
         rune_stages = set(rune_top["stage_id"].astype(str)) if ("stage_id" in rune_top.columns and not rune_top.empty) else set()
-        stages = sorted(equip_stages | rune_stages)
+
+        # stage 숫자 정렬
+        stages = sorted(list(equip_stages | rune_stages), key=lambda x: (pd.to_numeric(x, errors="coerce"), str(x)))
+
+        # pd.to_numeric이 NaN이면 비교가 애매하니 NaN은 뒤로 보내기
+        def stage_sort_key(x):
+            n = pd.to_numeric(x, errors="coerce")
+            return (n if pd.notna(n) else float("inf"), str(x))
+
+        stages = sorted(list(equip_stages | rune_stages), key=stage_sort_key)
 
         if not stages:
             st.warning("계산된 stage가 없습니다. (use_count가 전부 0이거나 데이터가 비어있을 수 있어요.)")
@@ -291,7 +361,7 @@ def render_segment(seg_key: str, seg_name: str, equip_file, rune_file):
 
             left, right = st.columns(2)
             with left:
-                st.markdown("### 장비 (타입별 Top 1)")
+                st.markdown("### 장비 (타입별 Top 1) - 세로 보기")
                 if equip_top.empty:
                     st.info("장비 결과가 없습니다.")
                 else:
@@ -301,7 +371,7 @@ def render_segment(seg_key: str, seg_name: str, equip_file, rune_file):
                     st.dataframe(view_e, use_container_width=True)
 
             with right:
-                st.markdown("### 룬 (Top 6)")
+                st.markdown("### 룬 (Top 6) - 세로 보기")
                 if rune_top.empty:
                     st.info("룬 결과가 없습니다.")
                 else:
@@ -316,7 +386,8 @@ def render_segment(seg_key: str, seg_name: str, equip_file, rune_file):
 
         if not equip_top.empty:
             e_csv = equip_top.to_csv(index=False).encode("utf-8-sig")
-            epv_csv = equip_pv.to_csv(index=False).encode("utf-8-sig") if not equip_pv.empty else None
+            ewide_csv = equip_wide.to_csv(index=False).encode("utf-8-sig") if not equip_wide.empty else None
+
             with col1:
                 st.download_button(
                     "장비 결과(세로) 다운로드",
@@ -325,18 +396,21 @@ def render_segment(seg_key: str, seg_name: str, equip_file, rune_file):
                     mime="text/csv",
                     key=f"dl_e_v_{seg_key}"
                 )
+
             with col3:
-                if epv_csv is not None:
+                if ewide_csv is not None:
                     st.download_button(
                         "장비 요약(가로) 다운로드",
-                        epv_csv,
-                        file_name=f"{seg_key}_equip_top_pivot.csv",
+                        ewide_csv,
+                        file_name=f"{seg_key}_equip_top_type_wide.csv",
                         mime="text/csv",
-                        key=f"dl_e_p_{seg_key}"
+                        key=f"dl_e_w_{seg_key}"
                     )
+
         if not rune_top.empty:
             r_csv = rune_top.to_csv(index=False).encode("utf-8-sig")
-            rpv_csv = rune_pv.to_csv(index=False).encode("utf-8-sig") if not rune_pv.empty else None
+            rwide_csv = rune_wide.to_csv(index=False).encode("utf-8-sig") if not rune_wide.empty else None
+
             with col2:
                 st.download_button(
                     "룬 결과(세로) 다운로드",
@@ -345,14 +419,15 @@ def render_segment(seg_key: str, seg_name: str, equip_file, rune_file):
                     mime="text/csv",
                     key=f"dl_r_v_{seg_key}"
                 )
+
             with col4:
-                if rpv_csv is not None:
+                if rwide_csv is not None:
                     st.download_button(
                         "룬 요약(가로) 다운로드",
-                        rpv_csv,
-                        file_name=f"{seg_key}_rune_top_pivot.csv",
+                        rwide_csv,
+                        file_name=f"{seg_key}_rune_top_rank_wide.csv",
                         mime="text/csv",
-                        key=f"dl_r_p_{seg_key}"
+                        key=f"dl_r_w_{seg_key}"
                     )
 
     st.caption("장비: stage×type별 use_count 합산 후 1등(타입별 1개). 룬: stage별 use_count 합산 Top 6.")
