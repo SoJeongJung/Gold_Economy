@@ -23,16 +23,40 @@ SEGMENTS = [
     ("heavy", "해비"),
 ]
 
-# 장비 타입 컬럼 순서(요구사항 고정)
-EQUIP_TYPE_ORDER = ["hat", "neck", "ring", "coat", "belt"]
+# 장비 타입 컬럼 순서(요구사항 고정) + boots 추가
+EQUIP_TYPE_ORDER = ["hat", "neck", "ring", "coat", "belt", "boots"]
+
+# 타입 값이 데이터마다 다를 수 있어서 canonical mapping
+TYPE_CANON_MAP = {
+    "hat": "hat",
+    "head": "hat",
+    "Hat": "hat",
+
+    "neck": "neck",
+    "Neck": "neck",
+
+    "ring": "ring",
+    "Ring": "ring",
+
+    "coat": "coat",
+    "Coat": "coat",
+    
+
+    "belt": "belt",
+    "Belt": "belt",
+
+    "boots": "boots",
+    "Boots": "boots",
+    "shoe": "boots",
+    "shoes": "boots",
+}
 
 # =========================================================
 # Utils
 # =========================================================
 def _normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
     """
-    안전장치: 공백/대소문자/하이픈 등 변형을 정리.
-    (사용자가 공백 문제를 해결했더라도, 실수 재발 방지용)
+    컬럼명 공백/대소문자/하이픈 등 흔한 변형을 정리.
     """
     df = df.copy()
 
@@ -113,8 +137,17 @@ def weighted_top_grade(df: pd.DataFrame, stage_col: str, grade_col: str, weight_
           .sort_values([stage_col, weight_col], ascending=[True, False])
     )
     top = g.groupby(stage_col, as_index=False).head(1)
-    s = top.set_index(stage_col)[grade_col]
-    return s
+    return top.set_index(stage_col)[grade_col]
+
+def canon_type(x: str) -> str:
+    """
+    master.type 값을 canonical로 통일 (예: Boots/boot/shoes -> boots)
+    """
+    if pd.isna(x):
+        return "unknown"
+    s = str(x).strip().lower()
+    s = re.sub(r"\s+", "", s)
+    return TYPE_CANON_MAP.get(s, s)
 
 # =========================================================
 # Compute (Equip)
@@ -122,9 +155,9 @@ def weighted_top_grade(df: pd.DataFrame, stage_col: str, grade_col: str, weight_
 def compute_equip_outputs(equip_usage: pd.DataFrame, master: pd.DataFrame):
     """
     반환:
-      - equip_final: stage, hat, neck, ring, coat, belt, grade   (이름만)
-      - equip_counts: stage, hat, neck, ring, coat, belt, grade  (use_count_sum)
-      - equip_debug_long: stage_id/type/id/name/grade/use_count_sum (세로 디버그/다운로드)
+      - equip_final: stage, hat, neck, ring, coat, belt, boots, grade   (이름만)
+      - equip_counts: stage, hat, neck, ring, coat, belt, boots, grade  (use_count_sum)
+      - equip_debug_long: stage/type/id/name/grade/use_count_sum (세로 디버그/다운로드)
     """
     u = equip_usage.copy()
     u["use_count"] = _to_int_series(u["use_count"])
@@ -136,7 +169,9 @@ def compute_equip_outputs(equip_usage: pd.DataFrame, master: pd.DataFrame):
 
     m = master.copy()
     m["id"] = m["id"].astype(str).str.strip()
-    m["type"] = m["type"].astype(str).str.strip().str.lower()
+    m["type"] = m["type"].apply(canon_type)     # ✅ boots 포함 canonical
+    m["name"] = m["name"].astype(str)
+    m["grade"] = m["grade"].astype(str)
 
     merged = safe_merge(m, agg, "equip_id", "장비")
 
@@ -146,12 +181,20 @@ def compute_equip_outputs(equip_usage: pd.DataFrame, master: pd.DataFrame):
 
     # 세로 디버그
     equip_debug_long = top1[["stage_id", "type", "equip_id", "name", "grade", "use_count_sum"]].copy()
-    equip_debug_long = equip_debug_long.rename(columns={"equip_id": "id"})
+    equip_debug_long = equip_debug_long.rename(columns={"stage_id": "stage", "equip_id": "id"})
+    equip_debug_long = sort_stage(equip_debug_long, "stage")
 
-    # 요구사항 타입만 남기기(원치 않는 타입이 섞이면 여기서 걸러짐)
+    # 요구사항 타입만 남기기
     top1_req = top1[top1["type"].isin(EQUIP_TYPE_ORDER)].copy()
 
-    # stage별 grade(가장 많이 사용된 grade) 산출: 선택된 타입들만 대상으로 weight 합산 후 최빈(가중)
+    # ✅ 장비가 "아예 안나오는" 가장 흔한 원인: type이 기대값과 다름
+    #    디버그 탭에서 확인할 수 있도록 unique type을 노출
+    #    (UI에서 보여주기만 하고 로직은 그대로)
+    unique_types = sorted([t for t in top1["type"].dropna().unique().tolist()])
+    if len(unique_types) > 0:
+        st.caption(f"DEBUG(장비 type 매칭 확인): 조인 후 발견된 type = {unique_types}")
+
+    # stage별 grade(가장 많이 사용된 grade): 선택된 타입들 기준으로 grade별 use_count_sum 합산 1등
     stage_grade = weighted_top_grade(top1_req, "stage_id", "grade", "use_count_sum")
 
     # 이름 wide
@@ -159,7 +202,7 @@ def compute_equip_outputs(equip_usage: pd.DataFrame, master: pd.DataFrame):
     # count wide
     cnt_wide = top1_req.pivot_table(index="stage_id", columns="type", values="use_count_sum", aggfunc="first")
 
-    # 컬럼 정렬/보장
+    # 컬럼 보장 + 순서 고정
     for t in EQUIP_TYPE_ORDER:
         if t not in name_wide.columns:
             name_wide[t] = pd.NA
@@ -171,15 +214,11 @@ def compute_equip_outputs(equip_usage: pd.DataFrame, master: pd.DataFrame):
 
     equip_final = name_wide.reset_index().rename(columns={"stage_id": "stage"})
     equip_final["grade"] = equip_final["stage"].map(stage_grade).fillna(pd.NA)
+    equip_final = sort_stage(equip_final, "stage")
 
     equip_counts = cnt_wide.reset_index().rename(columns={"stage_id": "stage"})
     equip_counts["grade"] = equip_counts["stage"].map(stage_grade).fillna(pd.NA)
-
-    equip_final = sort_stage(equip_final, "stage")
     equip_counts = sort_stage(equip_counts, "stage")
-    equip_debug_long = equip_debug_long.copy()
-    equip_debug_long = equip_debug_long.rename(columns={"stage_id": "stage"})
-    equip_debug_long = sort_stage(equip_debug_long, "stage")
 
     return equip_final, equip_counts, equip_debug_long
 
@@ -191,7 +230,7 @@ def compute_rune_outputs(rune_usage: pd.DataFrame, master: pd.DataFrame, top_n: 
     반환:
       - rune_final: stage, Top1..Top6, grade (이름만)
       - rune_counts: stage, Top1..Top6, grade (use_count_sum)
-      - rune_debug_long: stage_id/rank/id/name/grade/use_count_sum (세로 디버그/다운로드)
+      - rune_debug_long: stage/rank/id/name/grade/use_count_sum (세로 디버그/다운로드)
     """
     u = rune_usage.copy()
     u["use_count"] = _to_int_series(u["use_count"])
@@ -203,6 +242,8 @@ def compute_rune_outputs(rune_usage: pd.DataFrame, master: pd.DataFrame, top_n: 
 
     m = master.copy()
     m["id"] = m["id"].astype(str).str.strip()
+    m["name"] = m["name"].astype(str)
+    m["grade"] = m["grade"].astype(str)
 
     merged = safe_merge(m, agg, "rune_id", "룬")
 
@@ -213,12 +254,9 @@ def compute_rune_outputs(rune_usage: pd.DataFrame, master: pd.DataFrame, top_n: 
     # stage별 grade(가장 많이 사용된 grade): Top6만 대상으로 가중 합산
     stage_grade = weighted_top_grade(topn, "stage_id", "grade", "use_count_sum")
 
-    # 이름 wide
     name_wide = topn.pivot_table(index="stage_id", columns="rank", values="name", aggfunc="first")
-    # count wide
     cnt_wide = topn.pivot_table(index="stage_id", columns="rank", values="use_count_sum", aggfunc="first")
 
-    # Top1..Top6 보장
     for r in range(1, top_n + 1):
         if r not in name_wide.columns:
             name_wide[r] = pd.NA
@@ -228,16 +266,15 @@ def compute_rune_outputs(rune_usage: pd.DataFrame, master: pd.DataFrame, top_n: 
     name_wide = name_wide[[r for r in range(1, top_n + 1)]]
     cnt_wide = cnt_wide[[r for r in range(1, top_n + 1)]]
 
-    name_wide.columns = [f"Top{r}" for r in range(1, top_n + 1)]
-    cnt_wide.columns = [f"Top{r}" for r in range(1, top_n + 1)]
+    name_wide.columns = [f"Top{i}" for i in range(1, top_n + 1)]
+    cnt_wide.columns = [f"Top{i}" for i in range(1, top_n + 1)]
 
     rune_final = name_wide.reset_index().rename(columns={"stage_id": "stage"})
     rune_final["grade"] = rune_final["stage"].map(stage_grade).fillna(pd.NA)
+    rune_final = sort_stage(rune_final, "stage")
 
     rune_counts = cnt_wide.reset_index().rename(columns={"stage_id": "stage"})
     rune_counts["grade"] = rune_counts["stage"].map(stage_grade).fillna(pd.NA)
-
-    rune_final = sort_stage(rune_final, "stage")
     rune_counts = sort_stage(rune_counts, "stage")
 
     rune_debug_long = topn[["stage_id", "rank", "rune_id", "name", "grade", "use_count_sum"]].copy()
@@ -293,17 +330,12 @@ if not ok:
     st.error(msg)
     st.stop()
 
-# master normalize
 master["id"] = master["id"].astype(str).str.strip()
-master["type"] = master["type"].astype(str).str.strip().str.lower()
+master["type"] = master["type"].apply(canon_type)  # ✅ canonical
 master["name"] = master["name"].astype(str)
 master["grade"] = master["grade"].astype(str)
 
-available_segments = []
-for seg_key, info in segment_uploads.items():
-    if info["equip"] is not None or info["rune"] is not None:
-        available_segments.append(seg_key)
-
+available_segments = [k for k, v in segment_uploads.items() if (v["equip"] is not None or v["rune"] is not None)]
 if not available_segments:
     st.info("캐주얼/미드코어/해비 중 최소 1개 세그먼트의 장비 또는 룬 로그를 업로드하세요.")
     st.stop()
@@ -335,7 +367,6 @@ def render_segment(seg_key: str, seg_name: str, equip_file, rune_file):
         st.warning("이 세그먼트는 업로드된 파일이 없거나(혹은 컬럼 오류로) 처리할 수 없습니다.")
         return
 
-    # Compute
     equip_final = pd.DataFrame()
     equip_counts = pd.DataFrame()
     equip_debug = pd.DataFrame()
@@ -350,18 +381,16 @@ def render_segment(seg_key: str, seg_name: str, equip_file, rune_file):
     if rune_usage is not None:
         rune_final, rune_counts, rune_debug = compute_rune_outputs(rune_usage, master, top_n=6)
 
-    # Tabs
     t1, t2, t3 = st.tabs(["요약 테이블(요구 포맷)", "사용횟수/디버그", "다운로드"])
 
     with t1:
         c1, c2 = st.columns(2)
 
         with c1:
-            st.markdown("### 장비 (stage, hat, neck, ring, coat, belt, grade)")
+            st.markdown("### 장비 (stage, hat, neck, ring, coat, belt, boots, grade)")
             if equip_final.empty:
                 st.info("장비 로그가 업로드되지 않았거나, 계산 결과가 없습니다.")
             else:
-                # 요구 컬럼 순서 보장
                 cols = ["stage"] + EQUIP_TYPE_ORDER + ["grade"]
                 for col in cols:
                     if col not in equip_final.columns:
@@ -384,7 +413,7 @@ def render_segment(seg_key: str, seg_name: str, equip_file, rune_file):
         c1, c2 = st.columns(2)
 
         with c1:
-            st.markdown("#### 장비 사용 횟수 (stage, hat..belt, grade)")
+            st.markdown("#### 장비 사용 횟수 (stage, hat..boots, grade)")
             if equip_counts.empty:
                 st.info("장비 사용횟수 테이블이 없습니다.")
             else:
@@ -427,7 +456,6 @@ def render_segment(seg_key: str, seg_name: str, equip_file, rune_file):
         st.markdown("### CSV 다운로드")
         dl_cols = st.columns(6)
 
-        # Equip
         if not equip_final.empty:
             cols = ["stage"] + EQUIP_TYPE_ORDER + ["grade"]
             equip_final_csv = equip_final[cols].to_csv(index=False).encode("utf-8-sig")
@@ -439,6 +467,7 @@ def render_segment(seg_key: str, seg_name: str, equip_file, rune_file):
                     mime="text/csv",
                     key=f"{seg_key}_dl_equip_summary",
                 )
+
         if not equip_counts.empty:
             cols = ["stage"] + EQUIP_TYPE_ORDER + ["grade"]
             equip_counts_csv = equip_counts[cols].to_csv(index=False).encode("utf-8-sig")
@@ -450,6 +479,7 @@ def render_segment(seg_key: str, seg_name: str, equip_file, rune_file):
                     mime="text/csv",
                     key=f"{seg_key}_dl_equip_counts",
                 )
+
         if not equip_debug.empty:
             equip_debug_csv = equip_debug.to_csv(index=False).encode("utf-8-sig")
             with dl_cols[2]:
@@ -461,7 +491,6 @@ def render_segment(seg_key: str, seg_name: str, equip_file, rune_file):
                     key=f"{seg_key}_dl_equip_debug",
                 )
 
-        # Rune
         if not rune_final.empty:
             cols = ["stage"] + [f"Top{i}" for i in range(1, 7)] + ["grade"]
             rune_final_csv = rune_final[cols].to_csv(index=False).encode("utf-8-sig")
@@ -473,6 +502,7 @@ def render_segment(seg_key: str, seg_name: str, equip_file, rune_file):
                     mime="text/csv",
                     key=f"{seg_key}_dl_rune_summary",
                 )
+
         if not rune_counts.empty:
             cols = ["stage"] + [f"Top{i}" for i in range(1, 7)] + ["grade"]
             rune_counts_csv = rune_counts[cols].to_csv(index=False).encode("utf-8-sig")
@@ -484,6 +514,7 @@ def render_segment(seg_key: str, seg_name: str, equip_file, rune_file):
                     mime="text/csv",
                     key=f"{seg_key}_dl_rune_counts",
                 )
+
         if not rune_debug.empty:
             rune_debug_csv = rune_debug.to_csv(index=False).encode("utf-8-sig")
             with dl_cols[5]:
