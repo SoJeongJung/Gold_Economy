@@ -24,6 +24,7 @@ TYPE_CANON_MAP = {
     "boots": "boots",
 }
 
+# ---------------- Utils ----------------
 def _normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
@@ -77,25 +78,17 @@ def canon_type(x: str) -> str:
     s = re.sub(r"\s+", "", s).lower()
     return TYPE_CANON_MAP.get(s, s)
 
-# ✅ 핵심: ID 정규화 (과학적 표기/소수/공백/숨은문자 대응)
 def normalize_id_series(s: pd.Series) -> pd.Series:
     s = s.astype(str)
-
-    # BOM/제로폭/특수 공백 제거
     s = s.str.replace("\ufeff", "", regex=False)
     s = s.str.replace("\u200b", "", regex=False)
-
     s = s.str.strip()
 
-    # 숫자처럼 보이면 숫자로 한번 바꿨다가 다시 문자열로 (1e+05 같은 것 대응)
     num = pd.to_numeric(s, errors="coerce")
-    # 숫자 변환 가능한 값만 정수 문자열로
     s2 = s.copy()
     mask = num.notna()
     if mask.any():
-        # 1001.0 -> 1001, 1e+05 -> 100000
         s2.loc[mask] = num.loc[mask].astype("Int64").astype(str)
-
     return s2
 
 def weighted_top_grade(df: pd.DataFrame, stage_col: str, grade_col: str, weight_col: str) -> pd.Series:
@@ -109,39 +102,14 @@ def weighted_top_grade(df: pd.DataFrame, stage_col: str, grade_col: str, weight_
     top = g.groupby(stage_col, as_index=False).head(1)
     return top.set_index(stage_col)[grade_col]
 
-def safe_merge_with_debug(master: pd.DataFrame, usage: pd.DataFrame, left_id_col: str, master_label: str):
+def safe_merge_with_debug(master: pd.DataFrame, usage: pd.DataFrame, left_id_col: str, master_label: str) -> pd.DataFrame:
     merged = usage.merge(master, how="left", left_on=left_id_col, right_on="id")
-    missing = merged[merged["name"].isna()].copy()
-    missing_cnt = int(missing.shape[0])
-
+    missing_cnt = int(merged["name"].isna().sum())
     if missing_cnt > 0:
         st.warning(f"{master_label}: 마스터 조인 실패 {missing_cnt}건 (id 미매칭).")
-
-        # 어떤 ID들이 실패했는지 상위 30개 표시
-        miss_top = (
-            missing.groupby(left_id_col, as_index=False)["use_count_sum"]
-                   .sum()
-                   .sort_values("use_count_sum", ascending=False)
-                   .head(30)
-        )
-        st.markdown(f"**{master_label} 조인 실패 ID Top 30 (use_count_sum 기준)**")
-        st.dataframe(miss_top, use_container_width=True)
-
-        # 다운로드 제공
-        csv = miss_top.to_csv(index=False).encode("utf-8-sig")
-        st.download_button(
-            f"{master_label} 조인 실패 ID Top30 다운로드",
-            csv,
-            file_name=f"{master_label}_missing_id_top30.csv",
-            mime="text/csv",
-            key=f"dl_missing_{master_label}_{left_id_col}"
-        )
-
     return merged
 
-# ---------------------------
-# Equip compute
-# ---------------------------
+# ---------------- Compute Equip ----------------
 def compute_equip_outputs(equip_usage: pd.DataFrame, master: pd.DataFrame):
     u = equip_usage.copy()
     u["use_count"] = _to_int_series(u["use_count"])
@@ -159,19 +127,13 @@ def compute_equip_outputs(equip_usage: pd.DataFrame, master: pd.DataFrame):
 
     merged = safe_merge_with_debug(m, agg, "equip_id", "장비")
 
-    # stage×type별 Top1
     merged = merged.sort_values(["stage_id", "type", "use_count_sum"], ascending=[True, True, False])
     top1 = merged.groupby(["stage_id", "type"], as_index=False).head(1)
 
-    # 타입 필터 (요구 타입만)
     top1_req = top1[top1["type"].isin(EQUIP_TYPE_ORDER)].copy()
-
-    # stage grade (가중합 최빈)
     stage_grade = weighted_top_grade(top1_req, "stage_id", "grade", "use_count_sum")
 
-    # 이름 wide
     name_wide = top1_req.pivot_table(index="stage_id", columns="type", values="name", aggfunc="first")
-    # count wide
     cnt_wide = top1_req.pivot_table(index="stage_id", columns="type", values="use_count_sum", aggfunc="first")
 
     for t in EQUIP_TYPE_ORDER:
@@ -191,16 +153,13 @@ def compute_equip_outputs(equip_usage: pd.DataFrame, master: pd.DataFrame):
     equip_counts["grade"] = equip_counts["stage"].map(stage_grade).fillna(pd.NA)
     equip_counts = sort_stage(equip_counts, "stage")
 
-    # 디버그(세로)
     equip_debug = top1[["stage_id", "type", "equip_id", "name", "grade", "use_count_sum"]].copy()
     equip_debug = equip_debug.rename(columns={"stage_id": "stage", "equip_id": "id"})
     equip_debug = sort_stage(equip_debug, "stage")
 
     return equip_final, equip_counts, equip_debug
 
-# ---------------------------
-# Rune compute (기존 그대로 유지)
-# ---------------------------
+# ---------------- Compute Rune ----------------
 def compute_rune_outputs(rune_usage: pd.DataFrame, master: pd.DataFrame, top_n: int = 6):
     u = rune_usage.copy()
     u["use_count"] = _to_int_series(u["use_count"])
@@ -253,7 +212,7 @@ def compute_rune_outputs(rune_usage: pd.DataFrame, master: pd.DataFrame, top_n: 
     return rune_final, rune_counts, rune_debug
 
 # =========================================================
-# UI
+# UI: Upload
 # =========================================================
 st.subheader("1) 마스터 업로드 (공용 1개)")
 master_file = st.file_uploader("장비/룬 마스터 CSV", type=["csv"], accept_multiple_files=False)
@@ -322,6 +281,17 @@ def render_segment(seg_key: str, seg_name: str, equip_file, rune_file):
     if rune_usage is not None:
         rune_final, rune_counts, rune_debug = compute_rune_outputs(rune_usage, master, top_n=6)
 
+    # ✅ 누락 표기 / 카운트 0 처리
+    if not equip_final.empty:
+        equip_final = equip_final.fillna("누락")
+    if not rune_final.empty:
+        rune_final = rune_final.fillna("누락")
+
+    if not equip_counts.empty:
+        equip_counts = equip_counts.fillna(0)
+    if not rune_counts.empty:
+        rune_counts = rune_counts.fillna(0)
+
     t1, t2 = st.tabs(["요약", "사용횟수/디버그"])
 
     with t1:
@@ -330,7 +300,7 @@ def render_segment(seg_key: str, seg_name: str, equip_file, rune_file):
             st.markdown("### 장비 요약")
             cols_e = ["stage"] + EQUIP_TYPE_ORDER + ["grade"]
             if equip_final.empty:
-                st.info("장비 결과가 없습니다. (조인 실패 경고/ID Top 리스트를 확인하세요)")
+                st.info("장비 결과가 없습니다. (조인 실패 경고가 있다면 마스터 id 매칭을 확인하세요)")
             else:
                 st.dataframe(equip_final[cols_e], use_container_width=True)
 
