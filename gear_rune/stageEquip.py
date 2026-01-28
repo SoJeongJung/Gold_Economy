@@ -95,7 +95,7 @@ def top_equips_by_type_per_stage(equip_usage: pd.DataFrame, master: pd.DataFrame
 
 def top_runes_per_stage(rune_usage: pd.DataFrame, master: pd.DataFrame, top_n: int = 6) -> pd.DataFrame:
     """
-    stage_id별 사용량 Top N 룬 (룬은 type 없이)
+    stage_id별 사용량 Top N 룬
     """
     u = rune_usage.copy()
     u["use_count"] = _to_int_series(u["use_count"])
@@ -125,8 +125,8 @@ def stage_pivot_view(df: pd.DataFrame, kind: str) -> pd.DataFrame:
     - equip: type 기준 정렬(타입 6개)
     - rune : use_count 내림차순
     """
-    if df.empty:
-        return df
+    if df is None or df.empty:
+        return pd.DataFrame()
 
     tmp = df.copy()
     if kind == "equip":
@@ -175,6 +175,7 @@ for i, (seg_key, seg_name) in enumerate(SEGMENTS):
             key=f"equip_{seg_key}"
         )
         st.caption("장비 로그 컬럼: stage_id, equip_id, use_count")
+
         rune_f = st.file_uploader(
             f"{seg_name} - 룬 로그",
             type=["csv"],
@@ -194,10 +195,12 @@ if not master_file:
 # master load/validate
 master = pd.read_csv(master_file)
 master = _normalize_cols(master)
+
 ok, msg = validate_cols(master, REQUIRED_MASTER_COLS, "마스터")
 if not ok:
     st.error(msg)
     st.stop()
+
 master["id"] = master["id"].astype(str).str.strip()
 
 # 어떤 세그먼트가 업로드됐는지 판단 (장비/룬 둘 중 하나라도 있으면 탭 생성)
@@ -213,10 +216,15 @@ if not available_segments:
 # =========================================================
 # Per-segment rendering
 # =========================================================
+def _empty_equip_top() -> pd.DataFrame:
+    return pd.DataFrame(columns=["stage_id", "type", "id", "name", "grade", "use_count_sum"])
+
+def _empty_rune_top() -> pd.DataFrame:
+    return pd.DataFrame(columns=["stage_id", "id", "name", "grade", "use_count_sum"])
+
 def render_segment(seg_key: str, seg_name: str, equip_file, rune_file):
     st.markdown(f"## {seg_name}")
 
-    # load (if provided)
     equip_usage = None
     rune_usage = None
 
@@ -238,9 +246,9 @@ def render_segment(seg_key: str, seg_name: str, equip_file, rune_file):
         st.warning("이 세그먼트는 업로드된 파일이 없거나(혹은 컬럼 오류로) 처리할 수 없습니다.")
         return
 
-    # compute (if each exists)
-    equip_top = pd.DataFrame()
-    rune_top = pd.DataFrame()
+    # ✅ 빈 DF라도 '컬럼을 가진' 형태로 초기화 (KeyError 방지)
+    equip_top = _empty_equip_top()
+    rune_top = _empty_rune_top()
     equip_pv = pd.DataFrame()
     rune_pv = pd.DataFrame()
 
@@ -252,7 +260,6 @@ def render_segment(seg_key: str, seg_name: str, equip_file, rune_file):
         rune_top = top_runes_per_stage(rune_usage, master, top_n=6)
         rune_pv = stage_pivot_view(rune_top, kind="rune")
 
-    # tabs inside segment
     inner_tabs = st.tabs(["Stage별 요약(가로)", "Stage 상세(세로)", "다운로드"])
 
     with inner_tabs[0]:
@@ -272,10 +279,11 @@ def render_segment(seg_key: str, seg_name: str, equip_file, rune_file):
                 st.dataframe(rune_pv, use_container_width=True)
 
     with inner_tabs[1]:
-        # stage list is union of computed stages
-        stages = sorted(
-            set(equip_top["stage_id"].astype(str)) | set(rune_top["stage_id"].astype(str))
-        )
+        # ✅ stage union도 컬럼 존재/empty 안전하게
+        equip_stages = set(equip_top["stage_id"].astype(str)) if ("stage_id" in equip_top.columns and not equip_top.empty) else set()
+        rune_stages = set(rune_top["stage_id"].astype(str)) if ("stage_id" in rune_top.columns and not rune_top.empty) else set()
+        stages = sorted(equip_stages | rune_stages)
+
         if not stages:
             st.warning("계산된 stage가 없습니다. (use_count가 전부 0이거나 데이터가 비어있을 수 있어요.)")
         else:
@@ -304,7 +312,6 @@ def render_segment(seg_key: str, seg_name: str, equip_file, rune_file):
 
     with inner_tabs[2]:
         st.markdown("### 결과 CSV 다운로드")
-
         col1, col2, col3, col4 = st.columns(4)
 
         if not equip_top.empty:
@@ -327,15 +334,6 @@ def render_segment(seg_key: str, seg_name: str, equip_file, rune_file):
                         mime="text/csv",
                         key=f"dl_e_p_{seg_key}"
                     )
-                else:
-                    st.write("")
-        else:
-            with col1:
-                st.write("")
-
-            with col3:
-                st.write("")
-
         if not rune_top.empty:
             r_csv = rune_top.to_csv(index=False).encode("utf-8-sig")
             rpv_csv = rune_pv.to_csv(index=False).encode("utf-8-sig") if not rune_pv.empty else None
@@ -356,13 +354,6 @@ def render_segment(seg_key: str, seg_name: str, equip_file, rune_file):
                         mime="text/csv",
                         key=f"dl_r_p_{seg_key}"
                     )
-                else:
-                    st.write("")
-        else:
-            with col2:
-                st.write("")
-            with col4:
-                st.write("")
 
     st.caption("장비: stage×type별 use_count 합산 후 1등(타입별 1개). 룬: stage별 use_count 합산 Top 6.")
 
