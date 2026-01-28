@@ -109,6 +109,17 @@ def safe_merge_with_debug(master: pd.DataFrame, usage: pd.DataFrame, left_id_col
         st.warning(f"{master_label}: 마스터 조인 실패 {missing_cnt}건 (id 미매칭).")
     return merged
 
+def format_name_count(name, cnt) -> str:
+    if pd.isna(name) or name is None or str(name).strip() == "" or str(name) == "nan":
+        return "누락"
+    try:
+        if pd.isna(cnt):
+            return str(name)
+        c = int(cnt)
+        return f"{name} ({c})"
+    except Exception:
+        return f"{name} ({cnt})"
+
 # ---------------- Compute Equip ----------------
 def compute_equip_outputs(equip_usage: pd.DataFrame, master: pd.DataFrame):
     u = equip_usage.copy()
@@ -133,6 +144,7 @@ def compute_equip_outputs(equip_usage: pd.DataFrame, master: pd.DataFrame):
     top1_req = top1[top1["type"].isin(EQUIP_TYPE_ORDER)].copy()
     stage_grade = weighted_top_grade(top1_req, "stage_id", "grade", "use_count_sum")
 
+    # wide name & count
     name_wide = top1_req.pivot_table(index="stage_id", columns="type", values="name", aggfunc="first")
     cnt_wide = top1_req.pivot_table(index="stage_id", columns="type", values="use_count_sum", aggfunc="first")
 
@@ -223,7 +235,6 @@ st.subheader("2) 세그먼트별 로그 업로드 (선택)")
 
 cols = st.columns(3)
 segment_uploads: Dict[str, Dict[str, Optional[object]]] = {}
-
 for i, (seg_key, seg_name) in enumerate(SEGMENTS):
     with cols[i]:
         st.markdown(f"### {seg_name}")
@@ -281,7 +292,7 @@ def render_segment(seg_key: str, seg_name: str, equip_file, rune_file):
     if rune_usage is not None:
         rune_final, rune_counts, rune_debug = compute_rune_outputs(rune_usage, master, top_n=6)
 
-    # ✅ 누락 표기 / 카운트 0 처리
+    # 누락 표기 / 카운트 0 처리
     if not equip_final.empty:
         equip_final = equip_final.fillna("누락")
     if not rune_final.empty:
@@ -292,30 +303,53 @@ def render_segment(seg_key: str, seg_name: str, equip_file, rune_file):
     if not rune_counts.empty:
         rune_counts = rune_counts.fillna(0)
 
-    t1, t2 = st.tabs(["요약", "사용횟수/디버그"])
+    # ✅ 요약용 "이름 (횟수)" 테이블 생성 (UI 깔끔)
+    equip_display = pd.DataFrame()
+    if not equip_final.empty and not equip_counts.empty:
+        equip_display = equip_final.copy()
+        for t in EQUIP_TYPE_ORDER:
+            equip_display[t] = [
+                format_name_count(n, c)
+                for n, c in zip(equip_final[t].values, equip_counts[t].values)
+            ]
+        # grade는 그대로(가장 많이 사용된 grade)
+        equip_display["grade"] = equip_final["grade"]
+
+    rune_display = pd.DataFrame()
+    top_cols = [f"Top{i}" for i in range(1, 7)]
+    if not rune_final.empty and not rune_counts.empty:
+        rune_display = rune_final.copy()
+        for c in top_cols:
+            rune_display[c] = [
+                format_name_count(n, cnt)
+                for n, cnt in zip(rune_final[c].values, rune_counts[c].values)
+            ]
+        rune_display["grade"] = rune_final["grade"]
+
+    t1, t2 = st.tabs(["요약(이름+횟수)", "사용횟수/디버그"])
 
     with t1:
         c1, c2 = st.columns(2)
         with c1:
-            st.markdown("### 장비 요약")
+            st.markdown("### 장비 요약 (장비명 (횟수))")
             cols_e = ["stage"] + EQUIP_TYPE_ORDER + ["grade"]
-            if equip_final.empty:
-                st.info("장비 결과가 없습니다. (조인 실패 경고가 있다면 마스터 id 매칭을 확인하세요)")
+            if equip_display.empty:
+                st.info("장비 결과가 없습니다.")
             else:
-                st.dataframe(equip_final[cols_e], use_container_width=True)
+                st.dataframe(equip_display[cols_e], use_container_width=True)
 
         with c2:
-            st.markdown("### 룬 요약")
-            cols_r = ["stage"] + [f"Top{i}" for i in range(1, 7)] + ["grade"]
-            if rune_final.empty:
+            st.markdown("### 룬 요약 (룬명 (횟수))")
+            cols_r = ["stage"] + top_cols + ["grade"]
+            if rune_display.empty:
                 st.info("룬 결과가 없습니다.")
             else:
-                st.dataframe(rune_final[cols_r], use_container_width=True)
+                st.dataframe(rune_display[cols_r], use_container_width=True)
 
     with t2:
         c1, c2 = st.columns(2)
         with c1:
-            st.markdown("### 장비 use_count_sum")
+            st.markdown("### 장비 use_count_sum (숫자)")
             cols_e = ["stage"] + EQUIP_TYPE_ORDER + ["grade"]
             if equip_counts.empty:
                 st.info("장비 카운트 결과가 없습니다.")
@@ -323,8 +357,8 @@ def render_segment(seg_key: str, seg_name: str, equip_file, rune_file):
                 st.dataframe(equip_counts[cols_e], use_container_width=True)
 
         with c2:
-            st.markdown("### 룬 use_count_sum")
-            cols_r = ["stage"] + [f"Top{i}" for i in range(1, 7)] + ["grade"]
+            st.markdown("### 룬 use_count_sum (숫자)")
+            cols_r = ["stage"] + top_cols + ["grade"]
             if rune_counts.empty:
                 st.info("룬 카운트 결과가 없습니다.")
             else:
